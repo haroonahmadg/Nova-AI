@@ -21,5 +21,15 @@ and voice services. Authenticate and authorize server-side, keep user IDs
 attached to persistence and retrieval operations, and preserve the SSE event
 contract when modifying endpoints.
 
+`GET /health` and `GET /config/limits` are public. The limits endpoint
+currently returns `{"max_prompt_chars": <positive integer>}` so the frontend
+can validate against server configuration; request validation on the API
+remains authoritative. Chat SSE streams assistant text incrementally and can
+include generic activity, research-plan, image, citation, done, and error
+events. Tool-specific activity labels and IDs are not sent to the client.
+Citation items distinguish uploaded documents (`file`, `page`, `preview`) from
+web results (`type`, `title`, `url`); only actual, validated search-result
+URLs should be emitted.
+
 Configuration values and local startup steps are in the repository
 [README](../README.md) and [`.env.example`](../.env.example).

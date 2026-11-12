@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import math
 import contextvars
 import operator as op
@@ -11,7 +12,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -76,6 +77,66 @@ def emit_tool_event(
         pass
 
 
+def _web_search_results(result: Any) -> list[dict[str, str]]:
+    """Keep only usable, linkable Tavily results for grounding and citations."""
+    if isinstance(result, dict):
+        raw_results = result.get("results", [])
+    elif isinstance(result, list):
+        raw_results = result
+    else:
+        return []
+
+    if not isinstance(raw_results, list):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not isinstance(url, str):
+            continue
+        url = url.strip()
+        try:
+            parsed_url = urlsplit(url)
+            parsed_url.port
+        except ValueError:
+            continue
+        if (
+            parsed_url.scheme.lower() not in {"http", "https"}
+            or not parsed_url.hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or len(url) > 2048
+            or url in seen_urls
+        ):
+            continue
+
+        title = item.get("title")
+        content = item.get("content")
+        normalized_item = {
+            "title": title.strip()[:300]
+            if isinstance(title, str) and title.strip()
+            else parsed_url.hostname[:300],
+            "url": url,
+            "content": content.strip()[:4000] if isinstance(content, str) else "",
+        }
+        normalized.append(normalized_item)
+        seen_urls.add(url)
+        emit_tool_event(
+            "Web source found",
+            event="citation",
+            tool="web_search",
+            citation={
+                "type": "web",
+                "title": normalized_item["title"],
+                "url": normalized_item["url"],
+            },
+        )
+    return normalized
+
+
 # =========================================================
 # ACTIVE SOURCE FILTER (thread/message attachment scoping)
 # =========================================================
@@ -92,22 +153,17 @@ active_user_id: "contextvars.ContextVar[str | None]" = (
 # =========================================================
 
 import os
+import json
 import logging
 import hashlib
 
 logger = logging.getLogger(__name__)
 
-HF_IMAGE_URL = "https://router.huggingface.co/v1/images/generations"
-HF_IMAGE_MODELS = (
-    "black-forest-labs/FLUX.1-dev",
-    "black-forest-labs/FLUX.1-schnell",
-)
-HF_IMAGE_STYLE_PREFIX = (
-    "photorealistic photograph, natural lighting, fine detail, "
-    "50mm lens — "
-)
-POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt/"
-IMAGE_TIMEOUT_SECONDS = 20
+GEMINI_IMAGE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+GEMINI_IMAGE_MODEL = "gemini-nano-banana-2.1"
+CLOUDFLARE_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+CLOUDFLARE_IMAGE_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+IMAGE_TIMEOUT_SECONDS = 60
 
 GENERATED_IMAGE_DIR = Path(
     os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent / "data"))
@@ -767,7 +823,8 @@ def web_search(
             }
         )
 
-        if not result:
+        search_results = _web_search_results(result)
+        if not search_results:
 
             emit_tool_event(
                 "Web search completed",
@@ -775,8 +832,11 @@ def web_search(
                 tool="web_search",
             )
 
+            if not result:
+                return "No search results were found."
             return (
-                "No search results were found."
+                "Search returned no usable results with valid HTTP or HTTPS "
+                "source links. Do not claim this search verified the answer."
             )
 
         emit_tool_event(
@@ -785,8 +845,9 @@ def web_search(
             tool="web_search",
         )
 
-        return str(
-            result
+        return json.dumps(
+            {"results": search_results},
+            ensure_ascii=False,
         )
 
     except Exception as exc:
@@ -1041,6 +1102,103 @@ def _describe_image_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _decode_generated_image(encoded: object) -> bytes:
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError("the image provider did not return image data.")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise ValueError("the image provider returned invalid image data.") from exc
+    if not image_bytes:
+        raise ValueError("the image provider returned an empty image.")
+    return image_bytes
+
+
+def _generate_gemini_image(prompt: str, api_key: str) -> bytes:
+    response = httpx.post(
+        GEMINI_IMAGE_URL,
+        headers={
+            "x-goog-api-key": api_key,
+            "Api-Revision": "2026-05-20",
+        },
+        json={
+            "model": GEMINI_IMAGE_MODEL,
+            "input": [{"type": "text", "text": prompt}],
+        },
+        timeout=IMAGE_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    image = payload.get("output_image")
+    if isinstance(image, dict) and image.get("data"):
+        return _decode_generated_image(image["data"])
+
+    outputs = payload.get("output")
+    if isinstance(outputs, list):
+        for item in outputs:
+            if isinstance(item, dict) and item.get("type") == "image":
+                return _decode_generated_image(item.get("data"))
+
+    raise ValueError("Gemini did not return a generated image.")
+
+
+def _generate_cloudflare_image(
+    prompt: str,
+    api_token: str,
+    account_id: str,
+) -> bytes:
+    if not re.fullmatch(r"[a-fA-F0-9]{32}", account_id):
+        raise ValueError("CLOUDFLARE_ACCOUNT_ID must be a 32-character account ID.")
+
+    response = httpx.post(
+        CLOUDFLARE_IMAGE_URL.format(
+            account_id=account_id,
+            model=CLOUDFLARE_IMAGE_MODEL,
+        ),
+        headers={"Authorization": f"Bearer {api_token}"},
+        json={"prompt": prompt},
+        timeout=IMAGE_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+    if response.headers.get("content-type", "").lower().startswith("image/"):
+        image_bytes = response.content
+        if image_bytes:
+            return image_bytes
+        raise ValueError("Cloudflare returned an empty image.")
+
+    payload = response.json()
+    result = payload.get("result")
+    if payload.get("success") is False or not isinstance(result, dict):
+        raise ValueError("Cloudflare did not return a generated image.")
+    return _decode_generated_image(result.get("image"))
+
+
+def _should_fallback_image_provider(exc: Exception) -> bool:
+    if isinstance(exc, (requests.exceptions.RequestException, httpx.RequestError)):
+        return True
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status in {401, 403, 408, 425, 429} or (
+        isinstance(status, int) and status >= 500
+    ):
+        return True
+    if status == 400:
+        try:
+            error = response.json().get("error", {})
+        except (AttributeError, ValueError):
+            return False
+        if not isinstance(error, dict):
+            return False
+        error_status = str(error.get("status", "")).upper()
+        message = str(error.get("message", "")).casefold()
+        return error_status in {"API_KEY_INVALID", "UNAUTHENTICATED"} or (
+            "api key" in message and ("invalid" in message or "not valid" in message)
+        )
+    return False
+
+
 # =========================================================
 # IMAGE GENERATION TOOL
 # =========================================================
@@ -1073,133 +1231,83 @@ def generate_image(
             f"(max {MAX_IMAGE_PROMPT_LENGTH} characters)."
         )
 
+    user_id = active_user_id.get()
+    if not user_id:
+        return "Image generation error: an authenticated user is required."
+
+    gemini_api_key = (
+        os.getenv("Gemini_API_Key", "").strip()
+        or os.getenv("GEMINI_API_KEY", "").strip()
+    )
+    cloudflare_api_token = (
+        os.getenv("Cloudflare_key", "").strip()
+        or os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+    )
+    cloudflare_account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    saved_path = None
+
     emit_tool_event(
-        "Generating image",
+        "Generating image with Gemini",
         event="tool_started",
         tool="generate_image",
     )
 
-    saved_path = None
-    api_key = (
-        os.getenv("HF_API_KEY", "").strip()
-        or os.getenv("HF_API_TOKEN", "").strip()
-    )
     try:
-        enhanced_prompt = f"{HF_IMAGE_STYLE_PREFIX}{prompt.strip()}"
-        last_error = None
-        for model_name in (HF_IMAGE_MODELS if api_key else ()):
+        if gemini_api_key:
             try:
-                response = httpx.post(
-                    HF_IMAGE_URL,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={"model": model_name, "prompt": enhanced_prompt},
-                    timeout=IMAGE_TIMEOUT_SECONDS,
+                image_bytes = _generate_gemini_image(prompt, gemini_api_key)
+            except Exception as gemini_error:
+                if not _should_fallback_image_provider(gemini_error):
+                    raise
+                if not cloudflare_api_token:
+                    raise
+                if not cloudflare_account_id:
+                    raise RuntimeError(
+                        "Gemini image generation failed and Cloudflare fallback "
+                        "requires CLOUDFLARE_ACCOUNT_ID."
+                    ) from gemini_error
+                logger.warning(
+                    "Gemini image request failed; trying Cloudflare Workers AI (error=%s).",
+                    type(gemini_error).__name__,
                 )
-                response.raise_for_status()
-                if response.headers.get("content-type", "").lower().startswith("image/"):
-                    image_bytes = response.content
-                else:
-                    payload = response.json()
-                    data = payload.get("data")
-                    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-                        raise ValueError("the service response did not include image data.")
-                    image_result = data[0]
-                    encoded_image = image_result.get("b64_json")
-                    image_url = image_result.get("url")
-                    if isinstance(encoded_image, str) and encoded_image:
-                        import base64
-
-                        image_bytes = base64.b64decode(encoded_image, validate=True)
-                    elif isinstance(image_url, str) and image_url:
-                        emit_tool_event(
-                            "Retrieving generated image",
-                            event="tool_started",
-                            tool="generate_image",
-                        )
-                        image_response = httpx.get(
-                            image_url,
-                            timeout=IMAGE_TIMEOUT_SECONDS,
-                        )
-                        image_response.raise_for_status()
-                        image_bytes = image_response.content
-                    else:
-                        raise ValueError("the service response did not include image data.")
-                if not image_bytes:
-                    raise ValueError("the service returned an empty image.")
-                user_id = active_user_id.get()
-                if not user_id:
-                    raise RuntimeError("An authenticated user is required to save generated images.")
-                filename = f"{uuid.uuid4().hex[:16]}.png"
-                saved_path = get_generated_image_dir(user_id, create=True) / filename
-
-                from PIL import Image
-                from io import BytesIO
-
-                with Image.open(BytesIO(image_bytes)) as image:
-                    image.convert("RGB").save(saved_path, format="PNG")
-
-                if saved_path.stat().st_size == 0:
-                    raise ValueError("received an empty image.")
-
                 emit_tool_event(
-                    "Image generation completed",
-                    event="tool_completed",
+                    "Trying Cloudflare image generation fallback",
+                    event="tool_started",
                     tool="generate_image",
                 )
-                return f"{GENERATED_IMAGE_MARKER}{filename}"
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                logger.warning(
-                    "Hugging Face image generation failed with %s for %s",
-                    type(exc).__name__,
-                    model_name,
+                image_bytes = _generate_cloudflare_image(
+                    prompt,
+                    cloudflare_api_token,
+                    cloudflare_account_id,
                 )
-                if model_name == HF_IMAGE_MODELS[-1]:
-                    break
-                logger.info(
-                    "Retrying Hugging Face image generation with fallback model %s",
-                    HF_IMAGE_MODELS[1],
+        elif cloudflare_api_token:
+            if not cloudflare_account_id:
+                raise RuntimeError(
+                    "Cloudflare image generation requires CLOUDFLARE_ACCOUNT_ID."
                 )
-                continue
-
-        if not api_key:
-            logger.info("HF_API_KEY is not configured; trying Pollinations fallback")
-        else:
-            logger.warning(
-                "Hugging Face image generation failed with both configured models (%s); "
-                "trying Pollinations fallback",
-                type(last_error).__name__ if last_error else "unknown error",
+            logger.info("Gemini_API_Key is not configured; using Cloudflare Workers AI.")
+            image_bytes = _generate_cloudflare_image(
+                prompt,
+                cloudflare_api_token,
+                cloudflare_account_id,
             )
-        emit_tool_event(
-            "Trying alternate image provider",
-            event="tool_started",
-            tool="generate_image",
-        )
-        fallback_response = httpx.get(
-            f"{POLLINATIONS_IMAGE_URL}{quote(prompt, safe='')}",
-            params={"width": 1024, "height": 1024, "nologo": "true"},
-            timeout=IMAGE_TIMEOUT_SECONDS,
-        )
-        fallback_response.raise_for_status()
-        if not fallback_response.headers.get("content-type", "").lower().startswith("image/"):
-            raise ValueError("the alternate image provider returned a non-image response.")
-        fallback_bytes = fallback_response.content
-        if not fallback_bytes:
-            raise ValueError("the alternate image provider returned an empty image.")
-        user_id = active_user_id.get()
-        if not user_id:
-            raise RuntimeError("An authenticated user is required to save generated images.")
+        else:
+            raise RuntimeError(
+                "Image generation is not configured. Set Gemini_API_Key or "
+                "configure Cloudflare Workers AI."
+            )
+
         filename = f"{uuid.uuid4().hex[:16]}.png"
         saved_path = get_generated_image_dir(user_id, create=True) / filename
 
         from PIL import Image
         from io import BytesIO
 
-        with Image.open(BytesIO(fallback_bytes)) as image:
+        with Image.open(BytesIO(image_bytes)) as image:
             image.convert("RGB").save(saved_path, format="PNG")
 
         if saved_path.stat().st_size == 0:
-            raise ValueError("received an empty image.")
+            raise ValueError("the image provider returned an empty image.")
 
         emit_tool_event(
             "Image generation completed",
@@ -1208,8 +1316,6 @@ def generate_image(
         )
         return f"{GENERATED_IMAGE_MARKER}{filename}"
 
-    except (requests.exceptions.Timeout, httpx.TimeoutException):
-        error_message = "image service timed out, please try again"
     except Exception as exc:
         logger.warning("Image generation failed with %s", type(exc).__name__)
         error_message = _describe_image_error(exc)
@@ -1638,11 +1744,19 @@ def save_user_memory(
             )
             return "Memory error: no active user session was found."
 
-        save_memory(
+        saved = save_memory(
             memory_key.strip(),
             memory_value.strip(),
             user_id,
         )
+
+        if not saved:
+            emit_tool_event(
+                "Saving user memory failed",
+                event="tool_error",
+                tool="save_user_memory",
+            )
+            return "Memory error: the memory could not be saved."
 
         emit_tool_event(
             "User memory saved",

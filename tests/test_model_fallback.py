@@ -6,6 +6,25 @@ from langchain_core.messages import HumanMessage
 from agent import graph
 
 
+def test_llm_enables_provider_token_streaming(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    graph.get_llm.cache_clear()
+    options = {}
+
+    def fake_chat_groq(**kwargs):
+        options.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(graph, "ChatGroq", fake_chat_groq)
+
+    try:
+        graph.get_llm("streaming-model")
+    finally:
+        graph.get_llm.cache_clear()
+
+    assert options["streaming"] is True
+
+
 def test_model_candidates_use_configured_primary_for_legacy_deployments(monkeypatch):
     monkeypatch.setenv("GROQ_MODEL", "custom/primary")
     monkeypatch.delenv("GROQ_MODELS", raising=False)

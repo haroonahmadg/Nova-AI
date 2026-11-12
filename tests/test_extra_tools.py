@@ -223,6 +223,21 @@ def test_get_movie_info_success_and_not_found(monkeypatch):
     assert "Movie not found" in agent_tools.get_movie_info.invoke({"title": "Missing"})
 
 
+def test_save_user_memory_reports_storage_failure(monkeypatch):
+    user_token = agent_tools.active_user_id.set("user-1")
+    monkeypatch.setattr(agent_tools, "save_memory", lambda *_args: False)
+    try:
+        result = agent_tools.save_user_memory.invoke({
+            "memory_key": "favorite color",
+            "memory_value": "blue",
+        })
+    finally:
+        agent_tools.active_user_id.reset(user_token)
+
+    assert "could not be saved" in result
+    assert "Memory saved successfully" not in result
+
+
 def test_get_datetime_success_and_invalid_zone():
     result = agent_tools.get_datetime.invoke({
         "timezone_name": "Asia/Karachi",

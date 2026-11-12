@@ -1,17 +1,8 @@
-"""
-Configuration for the FastAPI backend.
+"""Configuration for the FastAPI backend.
 
-NOTE ON DUPLICATION WITH app.py:
-app.py (the existing Streamlit frontend) defines its own copies of the
-upload-validation constants and the UI/thread database path below. app.py
-cannot be imported from here, because importing it executes Streamlit-only
-calls (st.set_page_config, st.sidebar, etc.) outside of a Streamlit runtime,
-which fails. These values are therefore intentionally duplicated as the
-single source of truth for the API, rather than refactoring them out of
-app.py — app.py is left completely untouched per the existing-architecture
-constraint. If both frontends need to share these values later, extracting
-them into a small shared module both files import would be the natural
-follow-up, but that is out of scope for this phase.
+Request limits are shared with the Streamlit frontend through
+``utils.limits``. UI and upload paths are configured here without importing
+``app.py``, whose Streamlit calls require an active Streamlit runtime.
 """
 
 from __future__ import annotations
@@ -19,9 +10,18 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from utils.limits import (
+    MAX_FILE_MB,
+    MAX_IMAGE_MB,
+    MAX_IMAGES_PER_REQUEST,
+    MAX_PROMPT_CHARS,
+    MAX_UPLOAD_FILES,
+    _positive_int,
+)
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Same on-disk locations app.py already uses, so both frontends see the
@@ -34,12 +34,6 @@ UPLOAD_DIR = Path(
     os.getenv("UPLOAD_DIR", str(DATA_DIR / "upload"))
 )
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-MAX_IMAGE_MB = float(os.getenv("MAX_IMAGE_MB", "10"))
-MAX_FILE_MB = float(os.getenv("MAX_FILE_MB", "25"))
-MAX_UPLOAD_FILES = int(os.getenv("MAX_UPLOAD_FILES", "10"))
-MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "3"))
-MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
 
 ALLOWED_IMAGE_EXTENSIONS = {
     ".png",
@@ -62,59 +56,44 @@ ALLOWED_FILE_EXTENSIONS = {
 }
 
 # Comma-separated list of allowed frontend origins for CORS, e.g.
-# "http://localhost:3000,https://myapp.example.com"
+# "http://localhost:3000,http://localhost:3001,https://myapp.example.com"
+_LOCAL_FRONTEND_ORIGINS = (
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+)
 FRONTEND_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
-        "FRONTEND_ORIGIN", "http://localhost:3000"
+        "FRONTEND_ORIGIN", ",".join(_LOCAL_FRONTEND_ORIGINS)
     ).split(",")
     if origin.strip()
 ]
 
-# ============================================================
-# IMAGE GENERATION (Hugging Face Inference API)
-# ============================================================
-
-HF_API_KEY = os.getenv("HF_API_KEY", "").strip() or os.getenv("HF_API_TOKEN", "").strip()
-HF_IMAGE_MODEL = os.getenv(
-    "HF_IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0"
-).strip()
-
 GENERATED_IMAGE_DIR = DATA_DIR / "generated_images"
 GENERATED_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================
-# AUTH (Phase 4a — single shared password, not multi-user accounts)
-#
-# APP_PASSWORD: the one password that unlocks the whole app. Required —
-# the API refuses to start without it, so a deployment can never
-# accidentally go live with no password set.
-#
-# SESSION_SECRET: used to sign session tokens (HMAC), so a token can't
-# be forged without knowing this value. Required for the same reason
-# as APP_PASSWORD — no silent "auth that doesn't actually check anything"
-# fallback.
-#
-# SESSION_TTL_SECONDS: how long a session token stays valid before the
-# person has to log in again. Defaults to 7 days.
-# ============================================================
-
-
-
-
 # ============================================================
 # AUTH (Google sign-in)
+# Google ID tokens are verified against GOOGLE_CLIENT_ID. App session
+# tokens are signed with SESSION_SECRET; set a unique, random secret.
+# SESSION_TTL_SECONDS defaults to 7 days.
 # ============================================================
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+SESSION_TTL_SECONDS = _positive_int(
+    "SESSION_TTL_SECONDS",
+    str(7 * 24 * 60 * 60),
+)
 
 
 
 
 
 # ============================================================
-# AUTH SETTINGS  (append this block to the END of api/config.py)
+# AUTH SETTINGS
 #
 # Every value can be overridden in .env; the defaults below apply
 # when a variable is not set. auth.py, rate_limit.py and main.py
@@ -123,13 +102,10 @@ SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", str(7 * 24 * 60 * 60)
 # already work.
 # ============================================================
 
-import os as _os
-
-
 def _auth_env_int(name: str, default: int, minimum: int = 1) -> int:
     """Read a whole-number setting from the environment, with validation."""
 
-    raw = _os.getenv(name)
+    raw = os.getenv(name)
 
     if raw is None or not raw.strip():
         return default

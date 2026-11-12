@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import clsx from "clsx";
+import Image from "next/image";
 import { Volume2, Square, Loader2, Copy, Check, Pencil, RotateCcw, Eye, EyeOff, ImagePlus, MoreHorizontal, Pin, PinOff, Archive, ArchiveRestore, Trash2, Download, Printer, PencilLine, FolderClosed } from "lucide-react";
 import { Sidebar, type AppView } from "@/components/Sidebar";
 import { CatLogo } from "@/components/CatLogo";
@@ -13,12 +13,40 @@ import { ChatInput } from "@/components/ChatInput";
 import { useChat } from "@/lib/useChat";
 import { useAuth } from "@/lib/useAuth";
 import { setUnauthorizedHandler } from "@/lib/api";
-import { fetchGeneratedImage, generateImage, listLibraryMedia } from "@/lib/api";
+import {
+  fetchGeneratedImage,
+  generateImage,
+  getPublicLimits,
+  listLibraryMedia,
+} from "@/lib/api";
 import type { LibraryMediaDTO } from "@/lib/types";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import type { Components } from "react-markdown";
+
+type GoogleCredentialResponse = { credential?: string };
+
+declare global {
+  interface Window {
+    __novaGoogleClientId?: string;
+    __novaGoogleCredentialHandler?: (credential: string) => void;
+    google?: {
+      accounts?: {
+        id?: {
+          initialize: (options: {
+            client_id: string;
+            callback: (response: GoogleCredentialResponse) => void;
+          }) => void;
+          renderButton: (
+            element: HTMLElement,
+            options: { theme: string; size: string; shape: string },
+          ) => void;
+        };
+      };
+    };
+  }
+}
 
 function markdownText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -123,6 +151,29 @@ export default function HomePage() {
     setUnauthorizedHandler(handleUnauthorized);
   }, [handleUnauthorized]);
 
+  const [maxPromptChars, setMaxPromptChars] = useState<number | null>(null);
+  const [limitsLoading, setLimitsLoading] = useState(true);
+  const [limitsError, setLimitsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void getPublicLimits(controller.signal)
+      .then(({ max_prompt_chars }) => setMaxPromptChars(max_prompt_chars))
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setLimitsError(
+            error instanceof Error
+              ? error.message
+              : "Could not load message limits.",
+          );
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLimitsLoading(false);
+      });
+    return () => controller.abort();
+  }, []);
+
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [activeView, setActiveView] = useState<AppView>("chat");
   const [imagePrompt, setImagePrompt] = useState("");
@@ -167,6 +218,7 @@ export default function HomePage() {
     addImageAttachments,
     removeImageAttachment,
     isRecording,
+    isTranscribing,
     voiceError,
     startRecording,
     stopRecording,
@@ -243,6 +295,8 @@ export default function HomePage() {
   useEffect(() => {
     if (activeView !== "library" || !isAuthenticated) return;
     const controller = new AbortController();
+    // The effect starts a cancellable request and its loading state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadLibrary(controller.signal);
     return () => controller.abort();
   }, [activeView, isAuthenticated, user?.email]);
@@ -285,10 +339,11 @@ export default function HomePage() {
   };
 
   useEffect(() => {
+    const generatedPreviewUrls = generatedPreviewUrlsRef.current;
     return () => {
       imageGenerationRef.current?.abort();
-      generatedPreviewUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-      generatedPreviewUrlsRef.current.clear();
+      generatedPreviewUrls.forEach((url) => URL.revokeObjectURL(url));
+      generatedPreviewUrls.clear();
     };
   }, []);
 
@@ -497,9 +552,12 @@ export default function HomePage() {
                 </div>
               )}
               {latestGeneratedUrl && (
-                <img
+                <Image
                   src={latestGeneratedUrl}
                   alt="Your generated image"
+                  width={1024}
+                  height={1024}
+                  unoptimized
                   className="mt-6 max-h-[65vh] max-w-full rounded-xl border border-surface-border"
                 />
               )}
@@ -530,7 +588,7 @@ export default function HomePage() {
                     {items.map((item) => (
                       <figure key={`${item.folder}/${item.filename}`} className="overflow-hidden rounded-xl border border-surface-border bg-surface-raised">
                         {item.kind === "image" ? (
-                          <img src={item.previewUrl} alt={item.filename} className="aspect-square w-full object-cover" loading="lazy" />
+                          <Image src={item.previewUrl} alt={item.filename} width={256} height={256} unoptimized className="aspect-square w-full object-cover" loading="lazy" />
                         ) : (
                           <a
                             href={item.previewUrl}
@@ -550,10 +608,9 @@ export default function HomePage() {
             ))}
           </main>
         ) : !hasConversation ? (
-          <main className="flex flex-1 flex-col items-center justify-center px-4">
-            <div className="w-full max-w-2xl">
+          <main className="flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-4">
+            <section className="flex w-full max-w-3xl flex-1 flex-col justify-center py-10">
               <HomeHero />
-
               <ChatInput
                 onSend={sendMessage}
                 disabled={isStreaming}
@@ -564,29 +621,34 @@ export default function HomePage() {
                 onAddImages={addImageAttachments}
                 onRemoveImageAttachment={removeImageAttachment}
                 isRecording={isRecording}
+                isTranscribing={isTranscribing}
                 onStartRecording={startRecording}
                 onStopRecording={stopRecording}
                 voiceError={voiceError}
+                maxPromptChars={maxPromptChars}
+                limitsLoading={limitsLoading}
+                limitsError={limitsError}
                 prefillText={editPrefill}
                 prefillKey={editSignal}
               />
-
               <QuickActions onSelect={sendMessage} />
-
+              <p className="mt-5 text-center text-xs text-white/40">
+                Nova GPT can make mistakes. Check important info.
+              </p>
               {sendError && (
                 <p
                   role="alert"
-                  className="mt-4 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-center text-xs text-red-400"
+                  className="mt-3 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-center text-xs text-red-400"
                 >
                   {sendError}
                 </p>
               )}
-            </div>
+            </section>
           </main>
         ) : (
-          <main className="flex flex-1 flex-col overflow-hidden px-4">
-            <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col overflow-hidden">
-              <div className="flex-1 overflow-y-auto thin-scrollbar py-4">
+          <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-[#0d0d0f] px-4">
+            <div className="-mx-4 min-h-0 flex-1 overflow-y-auto thin-scrollbar px-4">
+              <div className="mx-auto w-full max-w-3xl py-6">
                 {messagesLoading && (
                   <p className="text-center text-xs text-white/40">
                     Loading conversation…
@@ -608,32 +670,20 @@ export default function HomePage() {
                     return (
                       <div
                         key={message.id}
-                        className="group mb-3 flex w-full flex-col"
+                        className="group mb-6 flex w-full flex-col"
                       >
                         <div
                           className={
                             isUser
-                              ? "max-w-[80%] self-end rounded-2xl bg-accent px-4 py-2 text-sm text-white"
-                              : "max-w-[80%] self-start rounded-2xl bg-surface-raised px-4 py-2 text-sm text-white/90"
+                              ? "max-w-[85%] self-end rounded-3xl bg-[#303030] px-5 py-3 text-[15px] leading-7 text-white"
+                              : "w-full self-start text-[15px] leading-7 text-white/90"
                           }
                         >
-                        <div className="prose prose-invert prose-base max-w-none [&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1">
+                        <div className="prose prose-invert prose-base max-w-none [&_p]:my-2 [&_ul]:my-2 [&_ol]:my-2">
                           {showThinking ? (
-                            <span className="inline-flex items-center gap-2">
-                              <CatLogo animated className="h-7 w-7" />
-                              <ThinkingIndicator label={activityLabel} />
-                            </span>
+                            <ThinkingIndicator label={activityLabel} />
                           ) : (
                             <>
-                              {message.streaming && (
-                                <span
-                                  className="mb-2 inline-flex items-center gap-2"
-                                  aria-label="Nova GPT is responding"
-                                >
-                                  <CatLogo animated className="h-7 w-7" />
-                                  <span className="text-xs font-medium text-white/55">Nova GPT</span>
-                                </span>
-                              )}
                               {message.content && isUser ? (
                                 <p className="whitespace-pre-wrap">{message.content}</p>
                               ) : message.content ? (
@@ -645,12 +695,57 @@ export default function HomePage() {
                                   {message.content}
                                 </ReactMarkdown>
                               ) : null}
+                              {message.citations?.length ? (
+                                <section
+                                  aria-label="Sources"
+                                  className="mt-4 border-t border-white/10 pt-3 text-sm"
+                                >
+                                  <h3 className="mb-2 font-semibold text-white/75">
+                                    Sources
+                                  </h3>
+                                  <ul className="space-y-2">
+                                    {message.citations.map((citation, index) => (
+                                      <li
+                                        key={
+                                          "url" in citation
+                                            ? `web-${citation.url}`
+                                            : `document-${citation.file}-${citation.page ?? "unknown"}-${index}`
+                                        }
+                                      >
+                                        {"url" in citation ? (
+                                          <a
+                                            href={citation.url}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="break-words text-blue-300 underline decoration-blue-300/40 underline-offset-2 hover:text-blue-200"
+                                          >
+                                            {citation.title}
+                                            <span className="ml-1 text-xs text-white/45">
+                                              (web source)
+                                            </span>
+                                          </a>
+                                        ) : (
+                                          <span className="text-white/70">
+                                            {citation.file}
+                                            {citation.page !== null
+                                              ? `, page ${citation.page}`
+                                              : ""}
+                                          </span>
+                                        )}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </section>
+                              ) : null}
                               {message.streaming && (
                                 <span className="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-white/70 align-middle" />
                               )}{message.imageUrl && (
-  <img
+  <Image
     src={message.imageUrl}
     alt="Generated image"
+    width={1024}
+    height={1024}
+    unoptimized
     className="mt-2 max-w-full rounded-xl border border-surface-border"
   />
 )}
@@ -733,25 +828,31 @@ export default function HomePage() {
                   </p>
                 )}
               </div>
-
-              <div className="pb-4">
-                <ChatInput
-                  onSend={sendMessage}
-                  disabled={isStreaming}
-                  attachments={attachments}
-                  onAddFiles={addAttachments}
-                  onRemoveAttachment={removeAttachment}
-                  imageAttachments={imageAttachments}
-                  onAddImages={addImageAttachments}
-                  onRemoveImageAttachment={removeImageAttachment}
-                  isRecording={isRecording}
-                  onStartRecording={startRecording}
-                  onStopRecording={stopRecording}
-                  voiceError={voiceError}
-                  prefillText={editPrefill}
-                  prefillKey={editSignal}
-                />
-              </div>
+            </div>
+            <div className="mx-auto w-full max-w-3xl shrink-0 pb-4 pt-3">
+              <ChatInput
+                onSend={sendMessage}
+                disabled={isStreaming}
+                attachments={attachments}
+                onAddFiles={addAttachments}
+                onRemoveAttachment={removeAttachment}
+                imageAttachments={imageAttachments}
+                onAddImages={addImageAttachments}
+                onRemoveImageAttachment={removeImageAttachment}
+                isRecording={isRecording}
+                isTranscribing={isTranscribing}
+                onStartRecording={startRecording}
+                onStopRecording={stopRecording}
+                voiceError={voiceError}
+                maxPromptChars={maxPromptChars}
+                limitsLoading={limitsLoading}
+                limitsError={limitsError}
+                prefillText={editPrefill}
+                prefillKey={editSignal}
+              />
+              <p className="mt-2 text-center text-xs text-white/40">
+                Nova GPT can make mistakes. Check important info.
+              </p>
             </div>
           </main>
         )}
@@ -779,35 +880,40 @@ function LoginScreen({
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [name, setName] = useState("");
-  const [googleButtonError, setGoogleButtonError] = useState<string | null>(null);
+  const [googleButtonError, setGoogleButtonError] = useState<string | null>(() =>
+    process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID
+      ? null
+      : "Google sign-in is not configured for this app.",
+  );
 
   useEffect(() => {
     const scriptId = "google-identity-services";
     const googleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
 
-    if (!googleClientId) {
-      setGoogleButtonError("Google sign-in is not configured for this app.");
-      return;
-    }
+    if (!googleClientId) return;
+    window.__novaGoogleCredentialHandler = onGoogleLogin;
 
     function renderButton() {
-      const google = (window as any).google;
-      if (!google?.accounts?.id || !buttonRef.current) {
+      const google = window.google;
+      if (!google?.accounts?.id || !buttonRef.current || !googleClientId) {
         setGoogleButtonError("Google sign-in could not be loaded. Refresh and try again.");
         return;
       }
 
-      google.accounts.id.initialize({
-        client_id: googleClientId,
-        callback: (response: { credential?: string }) => {
-          if (!response.credential) {
-            setGoogleButtonError("Google did not return a sign-in credential. Please try again.");
-            return;
-          }
-          setGoogleButtonError(null);
-          onGoogleLogin(response.credential);
-        },
-      });
+      if (window.__novaGoogleClientId !== googleClientId) {
+        google.accounts.id.initialize({
+          client_id: googleClientId,
+          callback: (response: { credential?: string }) => {
+            if (!response.credential) {
+              setGoogleButtonError("Google did not return a sign-in credential. Please try again.");
+              return;
+            }
+            setGoogleButtonError(null);
+            window.__novaGoogleCredentialHandler?.(response.credential);
+          },
+        });
+        window.__novaGoogleClientId = googleClientId;
+      }
 
       google.accounts.id.renderButton(buttonRef.current, {
         theme: "filled_black",
@@ -818,7 +924,7 @@ function LoginScreen({
 
     const existingScript = document.getElementById(scriptId) as HTMLScriptElement | null;
     if (existingScript) {
-      if ((window as any).google?.accounts?.id) {
+      if (window.google?.accounts?.id) {
         renderButton();
       } else {
         existingScript.addEventListener("load", renderButton, { once: true });

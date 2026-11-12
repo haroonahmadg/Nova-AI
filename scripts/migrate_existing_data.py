@@ -9,7 +9,6 @@ Run manually, once, after your account exists:
 
 from __future__ import annotations
 
-import pickle
 import sqlite3
 import sys
 from pathlib import Path
@@ -18,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.store import get_ui_connection, get_all_users
 from agent.graph import CHECKPOINT_DB_PATH, create_checkpointer
-from rag.ingest import METADATA_PATH
+from rag.ingest import METADATA_PATH, assign_legacy_user_to_chunks
 from database.db import get_connection as get_memories_connection
 
 
@@ -97,23 +96,8 @@ def migrate_rag_metadata(user_id: str) -> None:
         print("No RAG metadata found — nothing to migrate.")
         return
 
-    with open(METADATA_PATH, "rb") as f:
-        registry = pickle.load(f)
-
-    if not isinstance(registry, list):
-        print("RAG metadata was not a list — skipping.")
-        return
-
-    changed = 0
-    for entry in registry:
-        if isinstance(entry, dict) and not entry.get("user_id"):
-            entry["user_id"] = user_id
-            changed += 1
-
-    with open(METADATA_PATH, "wb") as f:
-        pickle.dump(registry, f)
-
-    print(f"RAG metadata: {changed} chunk(s) assigned to user.")
+    changed = assign_legacy_user_to_chunks(user_id)
+    print(f"RAG metadata and FAISS index: {changed} chunk(s) assigned to user.")
 
 
 def migrate_memories(user_id: str) -> None:

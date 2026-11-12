@@ -17,14 +17,14 @@ interface QuickActionsProps {
 
 export function QuickActions({ onSelect }: QuickActionsProps) {
   return (
-    <div className="mt-4 flex flex-col gap-1">
+    <div className="mt-6 flex flex-col items-start gap-1">
       {ACTIONS.map(({ label, icon: Icon }) => (
         <button
           key={label}
           onClick={() => onSelect(label)}
-          className="flex items-center gap-3 rounded-lg px-2 py-1.5 text-left text-sm text-white/70 transition-colors hover:bg-surface-hover hover:text-white"
+          className="flex items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white/70 transition-colors hover:bg-white/5 hover:text-white"
         >
-          <Icon size={16} className="text-white/50" />
+          <Icon size={18} className="text-white/50" />
           {label}
         </button>
       ))}

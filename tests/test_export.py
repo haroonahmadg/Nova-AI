@@ -8,7 +8,10 @@ from fastapi.testclient import TestClient
 def api_client(monkeypatch, tmp_path):
     monkeypatch.setenv("UI_DB_PATH", str(tmp_path / "ui.sqlite"))
     monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "upload"))
-    monkeypatch.setenv("SESSION_SECRET", "test-export-session-secret")
+    monkeypatch.setenv(
+        "SESSION_SECRET",
+        "test-only-session-secret-that-is-long-enough-123456",
+    )
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
     monkeypatch.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.sqlite"))
     import api.main as api_main

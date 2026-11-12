@@ -31,12 +31,32 @@ import { getStoredToken } from "./useAuth";
 
 export type VoiceStatus = { messageId: string; state: "loading" | "playing" } | null;
 
+let attachmentIdSequence = 0;
+
+type RetryAttachments = {
+  files: FilePayload[];
+  images: { image_bytes: string; image_type: string; filename: string }[];
+};
+
+type LastTurnRequest = RetryAttachments & {
+  threadId: string;
+  userMessageId: string;
+  content: string;
+};
+
+function createAttachmentId(kind: "upload" | "image"): string {
+  attachmentIdSequence += 1;
+  return `${kind}-${Date.now()}-${attachmentIdSequence}`;
+}
+
 export function useChat() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [threadsLoading, setThreadsLoading] = useState(true);
   const [threadsError, setThreadsError] = useState<string | null>(null);
 
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const activeThreadIdRef = useRef<string | null>(null);
+  activeThreadIdRef.current = activeThreadId;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -46,16 +66,24 @@ export function useChat() {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [imageAttachments, setImageAttachments] = useState<ImageAttachment[]>([]);
   const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>(null);
 
   const abortRef = useRef<{ abort: () => void } | null>(null);
+  const threadLoadRequestRef = useRef(0);
+  const threadLoadAbortRef = useRef<AbortController | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
-  const audioChunksRef = useRef<BlobPart[]>([]);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioBytesRef = useRef(0);
+  const recordingLimitExceededRef = useRef(false);
+  const recordingStartRef = useRef(false);
+  const mountedRef = useRef(false);
   const speakAbortRef = useRef<AbortController | null>(null);
   const sessionTokenRef = useRef<string | null>(null);
   const generatedObjectUrlsRef = useRef<Set<string>>(new Set());
+  const lastTurnRequestRef = useRef<LastTurnRequest | null>(null);
 
   // -------------------- Letter-by-letter streaming reveal --------------------
   // Incoming "text" SSE events can arrive in large chunks; revealing a
@@ -108,6 +136,10 @@ export function useChat() {
   }, []);
 
   const resetChatState = useCallback(() => {
+    lastTurnRequestRef.current = null;
+    threadLoadRequestRef.current += 1;
+    threadLoadAbortRef.current?.abort();
+    threadLoadAbortRef.current = null;
     abortRef.current?.abort();
     stopSpeaking();
     setIsStreaming(false);
@@ -166,6 +198,11 @@ export function useChat() {
   }, [refreshThreads, resetChatState]);
 
   const selectThread = useCallback(async (threadId: string) => {
+    lastTurnRequestRef.current = null;
+    const requestId = ++threadLoadRequestRef.current;
+    threadLoadAbortRef.current?.abort();
+    const controller = new AbortController();
+    threadLoadAbortRef.current = controller;
     abortRef.current?.abort();
     stopSpeaking();
     setIsStreaming(false);
@@ -182,20 +219,30 @@ export function useChat() {
     setMessages([]);
 
     try {
-      const history = await getThreadMessages(threadId);
-      setMessages(history);
+      const history = await getThreadMessages(threadId, controller.signal);
+      if (threadLoadRequestRef.current === requestId) {
+        setMessages(history);
+      }
     } catch (err) {
-      setSendError(
-        err instanceof ApiError
-          ? err.message
-          : "Couldn't load this conversation.",
-      );
+      if (threadLoadRequestRef.current === requestId) {
+        setSendError(
+          err instanceof ApiError
+            ? err.message
+            : "Couldn't load this conversation.",
+        );
+      }
     } finally {
-      setMessagesLoading(false);
+      if (threadLoadRequestRef.current === requestId) {
+        setMessagesLoading(false);
+      }
     }
   }, [stopSpeaking]);
 
   const startNewChat = useCallback(() => {
+    lastTurnRequestRef.current = null;
+    threadLoadRequestRef.current += 1;
+    threadLoadAbortRef.current?.abort();
+    threadLoadAbortRef.current = null;
     abortRef.current?.abort();
     stopSpeaking();
     setIsStreaming(false);
@@ -234,7 +281,7 @@ export function useChat() {
       }
 
       const pending: Attachment[] = files.map((f) => ({
-        id: `upload-${Date.now()}-${f.name}`,
+        id: createAttachmentId("upload"),
         filename: f.name,
         filePath: null,
         status: "uploading",
@@ -290,7 +337,7 @@ export function useChat() {
         setImageAttachments((prev) => [
           ...prev,
           {
-            id: `image-${Date.now()}-${file.name}`,
+            id: createAttachmentId("image"),
             filename: file.name,
             imageBytes,
             imageType: file.type || "image/png",
@@ -325,7 +372,11 @@ export function useChat() {
   // -------------------- Send / stream --------------------
 
   const sendMessage = useCallback(
-    async (text: string) => {
+    async (
+      text: string,
+      researchMode = false,
+      retryRequest?: LastTurnRequest,
+    ) => {
       const trimmed = text.trim();
       const readyFiles = attachments.filter(
         (a) => a.status === "ready" && a.filePath,
@@ -354,20 +405,24 @@ export function useChat() {
         }
       }
 
-      const filePayloads: FilePayload[] = readyFiles.map((a) => ({
-        filename: a.filename,
-        file_path: a.filePath as string,
-      }));
+      const filePayloads: FilePayload[] =
+        retryRequest?.files ??
+        readyFiles.map((a) => ({
+          filename: a.filename,
+          file_path: a.filePath as string,
+        }));
 
-      const imagePayloads = imageAttachments.map((img) => ({
-        image_bytes: img.imageBytes,
-        image_type: img.imageType,
-        filename: img.filename,
-      }));
+      const imagePayloads =
+        retryRequest?.images ??
+        imageAttachments.map((img) => ({
+          image_bytes: img.imageBytes,
+          image_type: img.imageType,
+          filename: img.filename,
+        }));
 
       const attachmentNames = [
-        ...readyFiles.map((f) => f.filename),
-        ...imageAttachments.map((i) => i.filename),
+        ...filePayloads.map((file) => file.filename),
+        ...imagePayloads.map((image) => image.filename),
       ];
       const displaySuffix =
         attachmentNames.length > 0
@@ -384,6 +439,14 @@ export function useChat() {
         role: "assistant",
         content: "",
         streaming: true,
+      };
+
+      lastTurnRequestRef.current = {
+        threadId,
+        userMessageId: userMessage.id,
+        content: trimmed,
+        files: filePayloads,
+        images: imagePayloads,
       };
 
       setMessages((prev) => [...prev, userMessage, assistantMessage]);
@@ -497,6 +560,11 @@ export function useChat() {
             flushReveal(assistantMessage.id);
             setIsStreaming(false);
             setActivityLabel(null);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantMessage.id ? { ...m, streaming: false } : m,
+              ),
+            );
             setSendError(event.message);
           }
         },
@@ -504,8 +572,14 @@ export function useChat() {
           flushReveal(assistantMessage.id);
           setIsStreaming(false);
           setActivityLabel(null);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantMessage.id ? { ...m, streaming: false } : m,
+            ),
+          );
           setSendError(err.message || "The connection to the assistant was lost.");
         },
+        researchMode,
       );
     },
     [activeThreadId, attachments, imageAttachments, refreshThreads, startReveal, flushReveal],
@@ -577,18 +651,15 @@ export function useChat() {
 
   const removeThread = useCallback(
     async (threadId: string) => {
-      const prevThreads = threads;
-      setThreads((prev) => prev.filter((t) => t.threadId !== threadId));
-      if (activeThreadId === threadId) startNewChat();
-
       try {
         await apiDeleteThread(threadId);
+        setThreads((prev) => prev.filter((t) => t.threadId !== threadId));
+        if (activeThreadIdRef.current === threadId) startNewChat();
       } catch {
-        setThreads(prevThreads);
         setThreadsError("Couldn't delete that chat — please try again.");
       }
     },
-    [threads, activeThreadId, startNewChat],
+    [startNewChat],
   );
 
   const renameThread = useCallback(
@@ -620,68 +691,194 @@ export function useChat() {
   // -------------------- Voice input --------------------
 
   const startRecording = useCallback(async () => {
+    if (recordingStartRef.current || isRecording || isTranscribing) return;
+    recordingStartRef.current = true;
     setVoiceError(null);
+    setIsTranscribing(false);
 
-    if (!navigator.mediaDevices?.getUserMedia) {
+    if (
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof MediaRecorder === "undefined"
+    ) {
       setVoiceError("Voice input isn't supported in this browser.");
+      recordingStartRef.current = false;
       return;
     }
 
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      stream = mediaStream;
+      if (!mountedRef.current) {
+        mediaStream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
+      const mimeTypeCandidates = [
+        "audio/webm;codecs=opus",
+        "audio/ogg;codecs=opus",
+        "audio/mp4;codecs=mp4a.40.2",
+        "audio/webm",
+        "audio/ogg",
+        "audio/mp4",
+      ];
+      const supportedMimeType = mimeTypeCandidates.find((mimeType) =>
+        MediaRecorder.isTypeSupported?.(mimeType),
+      );
+      const recorder = supportedMimeType
+        ? new MediaRecorder(mediaStream, { mimeType: supportedMimeType })
+        : new MediaRecorder(mediaStream);
       audioChunksRef.current = [];
+      audioBytesRef.current = 0;
+      recordingLimitExceededRef.current = false;
 
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+        if (e.data.size === 0 || recordingLimitExceededRef.current) return;
+        const maxAudioBytes = 10 * 1024 * 1024;
+        if (audioBytesRef.current + e.data.size > maxAudioBytes) {
+          recordingLimitExceededRef.current = true;
+          audioChunksRef.current = [];
+          audioBytesRef.current = 0;
+          setVoiceError("Recording exceeds the 10 MB limit. Please record a shorter message.");
+          if (recorder.state !== "inactive") recorder.stop();
+          mediaStream.getTracks().forEach((track) => track.stop());
+          if (mediaRecorderRef.current === recorder) {
+            mediaRecorderRef.current = null;
+          }
+          setIsRecording(false);
+          return;
+        }
+        audioChunksRef.current.push(e.data);
+        audioBytesRef.current += e.data.size;
+      };
+      recorder.onerror = () => {
+        stream?.getTracks().forEach((track) => track.stop());
+        if (mediaRecorderRef.current === recorder) {
+          mediaRecorderRef.current = null;
+        }
+        setIsRecording(false);
+        setVoiceError("Recording failed. Check your microphone and try again.");
       };
 
       recorder.start();
       mediaRecorderRef.current = recorder;
       setIsRecording(true);
-    } catch {
+    } catch (error) {
+      stream?.getTracks().forEach((track) => track.stop());
+      const errorName = error instanceof DOMException ? error.name : "";
       setVoiceError(
-        "Couldn't access the microphone. Check your browser permissions.",
+        errorName === "NotFoundError"
+          ? "No microphone was found. Connect a microphone and try again."
+          : errorName === "NotAllowedError" || errorName === "SecurityError"
+            ? "Microphone access was denied. Allow microphone access and try again."
+            : "Couldn't start recording. Check microphone permissions and try again.",
       );
+    } finally {
+      recordingStartRef.current = false;
     }
-  }, []);
+  }, [isRecording, isTranscribing]);
 
   const stopRecording = useCallback((): Promise<string | null> => {
     return new Promise((resolve) => {
       const recorder = mediaRecorderRef.current;
       if (!recorder || recorder.state === "inactive") {
         setIsRecording(false);
+        recorder?.stream.getTracks().forEach((track) => track.stop());
+        mediaRecorderRef.current = null;
         resolve(null);
         return;
       }
 
+      let completed = false;
+      const finish = (text: string | null) => {
+        if (completed) return;
+        completed = true;
+        resolve(text);
+      };
+
       recorder.onstop = async () => {
+        if (completed) return;
         recorder.stream.getTracks().forEach((t) => t.stop());
+        if (mediaRecorderRef.current === recorder) {
+          mediaRecorderRef.current = null;
+        }
         setIsRecording(false);
 
-        const blob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+        const type =
+          recorder.mimeType ||
+          audioChunksRef.current.find((chunk) => chunk.type)?.type ||
+          "audio/webm";
+        if (recordingLimitExceededRef.current) {
+          audioChunksRef.current = [];
+          audioBytesRef.current = 0;
+          setVoiceError("Recording exceeds the 10 MB limit. Please record a shorter message.");
+          finish(null);
+          return;
+        }
+        const blob = new Blob(audioChunksRef.current, { type });
         audioChunksRef.current = [];
+        audioBytesRef.current = 0;
 
         if (blob.size === 0) {
           setVoiceError("No audio was captured — please try again.");
-          resolve(null);
+          finish(null);
           return;
         }
 
+        const extensionByMimeType: Record<string, string> = {
+          "audio/webm": "webm",
+          "audio/ogg": "ogg",
+          "audio/mp4": "mp4",
+          "audio/mpeg": "mp3",
+          "audio/wav": "wav",
+          "audio/x-wav": "wav",
+        };
+        const normalizedType = type.split(";")[0].trim().toLowerCase();
+        const filename = `recording.${extensionByMimeType[normalizedType] ?? "webm"}`;
+        setIsTranscribing(true);
         try {
-          const text = await transcribeAudio(blob);
-          resolve(text.trim() || null);
+          const text = (await transcribeAudio(blob, filename)).trim();
+          if (!text) {
+            setVoiceError("No speech was recognized. Please try again.");
+            finish(null);
+          } else {
+            finish(text);
+          }
         } catch (err) {
           setVoiceError(
             err instanceof ApiError
               ? err.message
               : "Couldn't transcribe that recording.",
           );
-          resolve(null);
+          finish(null);
+        } finally {
+          setIsTranscribing(false);
         }
       };
 
-      recorder.stop();
+      recorder.onerror = () => {
+        recorder.stream.getTracks().forEach((track) => track.stop());
+        if (mediaRecorderRef.current === recorder) {
+          mediaRecorderRef.current = null;
+        }
+        setIsRecording(false);
+        setVoiceError("Recording failed. Check your microphone and try again.");
+        finish(null);
+      };
+
+      try {
+        recorder.stop();
+      } catch {
+        recorder.stream.getTracks().forEach((track) => track.stop());
+        if (mediaRecorderRef.current === recorder) {
+          mediaRecorderRef.current = null;
+        }
+        setIsRecording(false);
+        setVoiceError("Could not stop the recording. Please try again.");
+        finish(null);
+      }
     });
   }, []);
 
@@ -761,6 +958,7 @@ export function useChat() {
       const removed = await apiEditLastMessage(activeThreadId);
       if (!removed) return null;
 
+      lastTurnRequestRef.current = null;
       setMessages((prev) => prev.slice(0, -2));
       return lastUserMessage?.content ?? "";
     } catch (err) {
@@ -776,9 +974,8 @@ export function useChat() {
   // Shares the exact same backend removal call as editLastMessage
   // (POST /threads/{id}/edit -> remove_last_turn), but instead of
   // handing the text back to prefill the input box, it immediately
-  // resends it as a new turn. Known limitation, matching the existing
-  // Edit flow: attachments/images from the original message are not
-  // reattached on retry, only the text.
+  // resends the original request, including its attachments when they
+  // are still available in this session.
 
   const retryLastMessage = useCallback(async (): Promise<void> => {
     if (!activeThreadId || isStreaming) return;
@@ -786,12 +983,29 @@ export function useChat() {
     const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
     if (!lastUserMessage) return;
 
+    const previousRequest = lastTurnRequestRef.current;
+    const canRestoreAttachments =
+      previousRequest?.threadId === activeThreadId &&
+      previousRequest.userMessageId === lastUserMessage.id;
+    const hasAttachmentMarker = lastUserMessage.content.includes("\n\n[Attached: ");
+    if (hasAttachmentMarker && !canRestoreAttachments) {
+      setSendError(
+        "The original attachments are no longer available to retry. Please reattach them and send the message again.",
+      );
+      return;
+    }
+
     try {
       const removed = await apiEditLastMessage(activeThreadId);
       if (!removed) return;
 
       setMessages((prev) => prev.slice(0, -2));
-      await sendMessage(lastUserMessage.content);
+      lastTurnRequestRef.current = null;
+      await sendMessage(
+        canRestoreAttachments ? previousRequest.content : lastUserMessage.content,
+        false,
+        canRestoreAttachments ? previousRequest : undefined,
+      );
     } catch (err) {
       setSendError(
         err instanceof ApiError ? err.message : "Couldn't retry that message.",
@@ -800,11 +1014,23 @@ export function useChat() {
   }, [activeThreadId, isStreaming, messages, sendMessage]);
 
   useEffect(() => {
+    mountedRef.current = true;
+    const revealTimers = revealTimerRef.current;
     return () => {
+      mountedRef.current = false;
+      threadLoadAbortRef.current?.abort();
       abortRef.current?.abort();
       audioElRef.current?.pause();
       speakAbortRef.current?.abort();
-      Object.values(revealTimerRef.current).forEach(clearInterval);
+      const recorder = mediaRecorderRef.current;
+      if (recorder) {
+        recorder.stream.getTracks().forEach((track) => track.stop());
+        if (recorder.state !== "inactive") recorder.stop();
+        mediaRecorderRef.current = null;
+      }
+      audioChunksRef.current = [];
+      audioBytesRef.current = 0;
+      Object.values(revealTimers).forEach(clearInterval);
     };
   }, []);
 
@@ -834,6 +1060,7 @@ export function useChat() {
     addImageAttachments,
     removeImageAttachment,
     isRecording,
+    isTranscribing,
     voiceError,
     startRecording,
     stopRecording,

@@ -12,7 +12,10 @@ def api_client(monkeypatch):
     tmp_path = Path(tmpdir)
     monkeypatch.setenv("UI_DB_PATH", str(tmp_path / "ui.sqlite"))
     monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "upload"))
-    monkeypatch.setenv("SESSION_SECRET", "test-secret-value")
+    monkeypatch.setenv(
+        "SESSION_SECRET",
+        "test-only-session-secret-that-is-long-enough-123456",
+    )
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
     monkeypatch.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.sqlite"))
 
@@ -49,6 +52,41 @@ def test_register_login_and_me(api_client):
     )
     assert login.status_code == 200, login.text
     assert login.json()["email"] == "user@example.com"
+
+
+def test_password_auth_does_not_require_google_client_id(api_client, monkeypatch):
+    client, _ = api_client
+    import api.auth as auth_module
+
+    monkeypatch.setattr(auth_module, "GOOGLE_CLIENT_ID", "")
+
+    register = client.post(
+        "/auth/register",
+        json={"email": "password-only@example.com", "password": "Password123"},
+    )
+    assert register.status_code == 200, register.text
+
+    login = client.post(
+        "/auth/login",
+        json={"email": "password-only@example.com", "password": "Password123"},
+    )
+    assert login.status_code == 200, login.text
+
+
+def test_auth_rejects_short_or_placeholder_session_secret(api_client, monkeypatch):
+    import api.auth as auth_module
+
+    monkeypatch.setattr(auth_module, "SESSION_SECRET", "short-secret")
+    with pytest.raises(RuntimeError, match="unique random value"):
+        auth_module._require_configured()
+
+    monkeypatch.setattr(
+        auth_module,
+        "SESSION_SECRET",
+        "change-me-to-a-long-random-string",
+    )
+    with pytest.raises(RuntimeError, match="unique random value"):
+        auth_module._require_configured()
 
 
 def test_google_login_rejected_for_invalid_token(api_client, monkeypatch):

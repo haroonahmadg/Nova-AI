@@ -1,8 +1,11 @@
 import os
 import pickle
+import shutil
+import tempfile
 import threading
 import time
 import contextvars
+from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Dict, Any
@@ -26,6 +29,7 @@ from bs4 import BeautifulSoup
 
 from filelock import FileLock, Timeout
 
+from rag.paths import DATA_DIR, FAISS_DIR, INDEX_PATH, METADATA_PATH, UPLOAD_DIR
 from utils.security import (
     validate_file_security,
     sanitize_path,
@@ -52,15 +56,6 @@ except ImportError:
 # this file's location makes it deployment-independent while keeping the
 # same on-disk layout ("<project_root>/data/faiss").
 # ---------------------------------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATA_DIR = str(PROJECT_ROOT / "data")
-DATA_DIR = os.getenv("DATA_DIR", DEFAULT_DATA_DIR)
-
-FAISS_DIR = os.path.join(DATA_DIR, "faiss")
-METADATA_PATH = os.path.join(FAISS_DIR, "metadata.pkl")
-INDEX_PATH = os.path.join(FAISS_DIR, "index.faiss")
-UPLOAD_DIR = os.path.join(DATA_DIR, "upload")
 
 # Concurrent ingestion (multi-file upload) can otherwise race on the same
 # FAISS index: two calls doing load -> add_documents -> save_local at once
@@ -613,6 +608,165 @@ def _register_chunks(
     )
 
 
+def _chunk_identity(source: Any, page: Any, chunk_id: Any, text: Any) -> tuple:
+    if not isinstance(source, str) or not isinstance(text, str):
+        raise RuntimeError("RAG metadata contains an invalid document identity.")
+    try:
+        hash((source, page, chunk_id, text))
+    except TypeError as exc:
+        raise RuntimeError(
+            "RAG metadata contains an invalid document identity."
+        ) from exc
+    return source, page, chunk_id, text
+
+
+def _write_pickle_atomically(path: str, value: Any) -> None:
+    directory = os.path.dirname(path) or "."
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=directory,
+            prefix=".rag-migration-",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = temporary_file.name
+            pickle.dump(value, temporary_file)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+
+
+def assign_legacy_user_to_chunks(user_id: str) -> int:
+    """Assign legacy RAG chunks to a user in both persisted metadata stores."""
+
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("A valid user_id is required.")
+    clean_user_id = user_id.strip()
+
+    with _faiss_lock():
+        if not os.path.isfile(METADATA_PATH):
+            return 0
+
+        with open(METADATA_PATH, "rb") as metadata_file:
+            registry = pickle.load(metadata_file)
+        if not isinstance(registry, list):
+            raise RuntimeError("RAG metadata registry must contain a list.")
+
+        legacy_entries = [
+            entry
+            for entry in registry
+            if isinstance(entry, dict) and not entry.get("user_id")
+        ]
+        if not legacy_entries:
+            return 0
+
+        index_pickle_path = os.path.join(FAISS_DIR, "index.pkl")
+        if not os.path.isfile(INDEX_PATH) or not os.path.isfile(index_pickle_path):
+            raise RuntimeError(
+                "Cannot migrate legacy RAG metadata because the FAISS index is missing."
+            )
+
+        with open(index_pickle_path, "rb") as index_file:
+            serialized_index = pickle.load(index_file)
+        if (
+            not isinstance(serialized_index, tuple)
+            or len(serialized_index) != 2
+        ):
+            raise RuntimeError("The FAISS document store has an invalid format.")
+
+        docstore, index_to_docstore_id = serialized_index
+        documents = getattr(docstore, "_dict", None)
+        if not isinstance(documents, dict) or not isinstance(
+            index_to_docstore_id, dict
+        ):
+            raise RuntimeError("The FAISS document store has an invalid format.")
+
+        legacy_counts: Counter[tuple] = Counter()
+        for entry in legacy_entries:
+            legacy_counts[
+                _chunk_identity(
+                    entry.get("source"),
+                    entry.get("page", 0),
+                    entry.get("chunk_id", 0),
+                    entry.get("text"),
+                )
+            ] += 1
+
+        matching_documents: dict[tuple, list[Document]] = defaultdict(list)
+        for document_id in index_to_docstore_id.values():
+            document = documents.get(document_id)
+            if document is None:
+                raise RuntimeError(
+                    "The FAISS index refers to a missing document; "
+                    "RAG migration was not applied."
+                )
+
+            metadata = getattr(document, "metadata", None)
+            if not isinstance(metadata, dict):
+                raise RuntimeError(
+                    "The FAISS index contains a document with invalid metadata."
+                )
+            document_user_id = metadata.get("user_id")
+            if document_user_id and document_user_id != clean_user_id:
+                continue
+
+            identity = _chunk_identity(
+                metadata.get("source"),
+                metadata.get("page", 0),
+                metadata.get("chunk_id", 0),
+                getattr(document, "page_content", None),
+            )
+            matching_documents[identity].append(document)
+
+        documents_changed = False
+        for identity, required_count in legacy_counts.items():
+            matches = matching_documents.get(identity, [])
+            if len(matches) < required_count:
+                raise RuntimeError(
+                    "The FAISS index and RAG metadata registry do not match; "
+                    "RAG migration was not applied."
+                )
+            unassigned_documents = [
+                document
+                for document in matches
+                if not document.metadata.get("user_id")
+            ]
+            already_assigned_documents = [
+                document
+                for document in matches
+                if document.metadata.get("user_id") == clean_user_id
+            ]
+            for document in (
+                unassigned_documents + already_assigned_documents
+            )[:required_count]:
+                if not document.metadata.get("user_id"):
+                    document.metadata["user_id"] = clean_user_id
+                    documents_changed = True
+
+        changed_count = 0
+        for entry in legacy_entries:
+            entry["user_id"] = clean_user_id
+            changed_count += 1
+
+        if documents_changed:
+            _write_pickle_atomically(
+                index_pickle_path,
+                (docstore, index_to_docstore_id),
+            )
+        _write_pickle_atomically(METADATA_PATH, registry)
+
+        return changed_count
+
+
 def _index_chunks_locked(
     source_name: str,
     chunks: List[Document],
@@ -632,12 +786,54 @@ def _index_chunks_locked(
 
     try:
         with _faiss_lock():
-            _save_chunks_to_faiss(
-                chunks,
-                embeddings,
-                source_name=source_name,
-            )
-            _register_chunks(source_name, chunks)
+            os.makedirs(FAISS_DIR, exist_ok=True)
+            paths = [
+                INDEX_PATH,
+                os.path.join(FAISS_DIR, "index.pkl"),
+                METADATA_PATH,
+            ]
+
+            with tempfile.TemporaryDirectory(
+                prefix=".ingest-backup-",
+                dir=FAISS_DIR,
+            ) as backup_dir:
+                existing_paths = {
+                    path: os.path.isfile(path)
+                    for path in paths
+                }
+                for path, exists in existing_paths.items():
+                    if exists:
+                        shutil.copy2(
+                            path,
+                            os.path.join(backup_dir, os.path.basename(path)),
+                        )
+
+                try:
+                    _save_chunks_to_faiss(
+                        chunks,
+                        embeddings,
+                        source_name=source_name,
+                    )
+                    _register_chunks(source_name, chunks)
+                except Exception as original_error:
+                    rollback_errors = []
+                    for path, existed in existing_paths.items():
+                        try:
+                            if existed:
+                                os.replace(
+                                    os.path.join(backup_dir, os.path.basename(path)),
+                                    path,
+                                )
+                            elif os.path.exists(path):
+                                os.remove(path)
+                        except OSError as rollback_error:
+                            rollback_errors.append(str(rollback_error))
+                    if rollback_errors:
+                        raise RuntimeError(
+                            "RAG index update failed and rollback was incomplete: "
+                            + "; ".join(rollback_errors)
+                        ) from original_error
+                    raise
 
     except Timeout as exc:
         raise ValueError(
@@ -1101,6 +1297,8 @@ def delete_document(
                             "page",
                             0,
                         ),
+                        "chunk_id": item.get("chunk_id", 0),
+                        "user_id": item.get("user_id"),
                     },
                 )
                 for item in remaining_entries
@@ -1638,6 +1836,8 @@ def delete_indexed_source(
                             "page",
                             0,
                         ),
+                        "chunk_id": item.get("chunk_id", 0),
+                        "user_id": item.get("user_id"),
                     },
                 )
                 for item in remaining_entries

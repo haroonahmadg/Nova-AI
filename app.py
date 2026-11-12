@@ -23,6 +23,14 @@ from agent.voice import (
     text_to_speech,
     transcribe_audio,
 )
+from database.db import initialize_database
+from utils.limits import (
+    MAX_FILE_MB,
+    MAX_IMAGE_MB,
+    MAX_IMAGES_PER_REQUEST,
+    MAX_PROMPT_CHARS,
+    MAX_UPLOAD_FILES,
+)
 
 
 # ============================================================
@@ -38,7 +46,7 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
 DATA_DIR.mkdir(
     parents=True,
     exist_ok=True,
@@ -62,12 +70,6 @@ UPLOAD_DIR.mkdir(
     parents=True,
     exist_ok=True,
 )
-
-MAX_IMAGE_MB = float(os.getenv("MAX_IMAGE_MB", "10"))
-MAX_FILE_MB = float(os.getenv("MAX_FILE_MB", "25"))
-MAX_UPLOAD_FILES = int(os.getenv("MAX_UPLOAD_FILES", "10"))
-MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "3"))
-MAX_PROMPT_CHARS = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
 
 # gTTS gets noticeably slower and more failure-prone on very long text, and
 # a multi-minute audio clip is not useful for a "listen to this reply"
@@ -496,7 +498,7 @@ def load_threads() -> dict[str, str]:
 
     try:
 
-        threads = get_all_saved_threads()
+        threads = get_all_saved_threads("local")
 
     except Exception:
 
@@ -635,7 +637,8 @@ def load_history(
     try:
 
         history = get_thread_history(
-            thread_id
+            "local",
+            thread_id,
         )
 
         if history:
@@ -658,7 +661,7 @@ def load_history(
 
         config = {
             "configurable": {
-                "thread_id": thread_id
+                "thread_id": f"local:{thread_id}"
             }
         }
 
@@ -1368,7 +1371,8 @@ def submit_message_edit(
         return
 
     removed = remove_last_turn(
-        st.session_state.thread_id
+        "local",
+        st.session_state.thread_id,
     )
 
     if not removed:
@@ -2410,6 +2414,7 @@ def main():
 
     try:
 
+        initialize_database()
         initialize_ui_database()
 
     except Exception as exc:

@@ -11,9 +11,22 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def image_api(monkeypatch):
     tmp_path = Path(tempfile.mkdtemp(prefix="ai-images-"))
+    for key in (
+        "Gemini_API_Key",
+        "GEMINI_API_KEY",
+        "Cloudflare_key",
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "HF_API_KEY",
+        "HF_API_TOKEN",
+    ):
+        monkeypatch.setenv(key, "")
     monkeypatch.setenv("UI_DB_PATH", str(tmp_path / "ui.sqlite"))
     monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "upload"))
-    monkeypatch.setenv("SESSION_SECRET", "image-test-secret")
+    monkeypatch.setenv(
+        "SESSION_SECRET",
+        "test-only-session-secret-that-is-long-enough-123456",
+    )
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
     monkeypatch.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.sqlite"))
 
@@ -33,6 +46,28 @@ def _create_account(client: TestClient, email: str) -> str:
     )
     assert response.status_code == 200, response.text
     return response.json()["token"]
+
+
+def _provider_response(url: str, payload: dict, status_code: int = 200):
+    import httpx
+
+    class FakeResponse:
+        headers = {"content-type": "application/json"}
+
+        def raise_for_status(self):
+            if status_code >= 400:
+                request = httpx.Request("POST", url)
+                response = httpx.Response(status_code, request=request, json=payload)
+                raise httpx.HTTPStatusError(
+                    f"HTTP {status_code}",
+                    request=request,
+                    response=response,
+                )
+
+        def json(self):
+            return payload
+
+    return FakeResponse()
 
 
 def test_image_library_is_account_scoped(image_api):
@@ -120,45 +155,24 @@ def test_image_generation_uses_authenticated_account(image_api, monkeypatch):
     assert calls == [user_id]
 
 
-def test_generate_image_uses_free_provider_and_saves_valid_image(image_api, monkeypatch):
+def test_generate_image_uses_gemini_and_saves_valid_image(image_api, monkeypatch):
     _, _, agent_tools = image_api
     import base64
     from io import BytesIO
     from PIL import Image
 
-    monkeypatch.setenv("HF_API_KEY", "test-key")
+    monkeypatch.setenv("Gemini_API_Key", "test-gemini-key")
     user_token = agent_tools.active_user_id.set("free-provider-user")
     image_bytes = BytesIO()
     Image.new("RGB", (2, 2), color="red").save(image_bytes, format="PNG")
     calls = []
 
-    class FakePostResponse:
-        headers = {"content-type": "application/json"}
-
-        def __init__(self, payload, status_code=200):
-            self._payload = payload
-            self.status_code = status_code
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                import httpx
-
-                request = httpx.Request("POST", agent_tools.HF_IMAGE_URL)
-                response = httpx.Response(self.status_code, request=request)
-                raise httpx.HTTPStatusError(
-                    f"HTTP {self.status_code}",
-                    request=request,
-                    response=response,
-                )
-
-        def json(self):
-            return self._payload
-
     def fake_post(url, **kwargs):
         calls.append(("post", url, kwargs))
-        return FakePostResponse({
-            "data": [{"b64_json": base64.b64encode(image_bytes.getvalue()).decode()}]
-        })
+        return _provider_response(
+            url,
+            {"output_image": {"data": base64.b64encode(image_bytes.getvalue()).decode()}},
+        )
 
     monkeypatch.setattr(agent_tools.httpx, "post", fake_post)
     monkeypatch.setattr(agent_tools, "emit_tool_event", lambda *args, **kwargs: None)
@@ -168,9 +182,10 @@ def test_generate_image_uses_free_provider_and_saves_valid_image(image_api, monk
         agent_tools.active_user_id.reset(user_token)
 
     assert result.startswith(agent_tools.GENERATED_IMAGE_MARKER)
-    assert calls[0][1] == agent_tools.HF_IMAGE_URL
-    assert calls[0][2]["json"]["model"] == agent_tools.HF_IMAGE_MODELS[0]
-    assert calls[0][2]["json"]["prompt"].startswith(agent_tools.HF_IMAGE_STYLE_PREFIX)
+    assert calls[0][1] == agent_tools.GEMINI_IMAGE_URL
+    assert calls[0][2]["headers"]["x-goog-api-key"] == "test-gemini-key"
+    assert calls[0][2]["json"]["model"] == agent_tools.GEMINI_IMAGE_MODEL
+    assert calls[0][2]["json"]["input"][0]["text"] == "A cat in a garden"
     image_path = (
         agent_tools.get_generated_image_dir("free-provider-user")
         / f"{result.removeprefix(agent_tools.GENERATED_IMAGE_MARKER)}"
@@ -179,46 +194,54 @@ def test_generate_image_uses_free_provider_and_saves_valid_image(image_api, monk
         assert saved.size == (2, 2)
 
 
-def test_generate_image_retries_schnell_after_dev_failure(image_api, monkeypatch):
+@pytest.mark.parametrize(
+    ("gemini_status_code", "gemini_payload"),
+    [
+        (401, {}),
+        (403, {}),
+        (429, {}),
+        (500, {}),
+        (
+            400,
+            {
+                "error": {
+                    "status": "API_KEY_INVALID",
+                    "message": "API key not valid.",
+                }
+            },
+        ),
+    ],
+)
+def test_generate_image_falls_back_to_cloudflare_for_retryable_gemini_errors(
+    image_api, monkeypatch, gemini_status_code, gemini_payload
+):
     _, _, agent_tools = image_api
     import base64
     from io import BytesIO
     from PIL import Image
-    import httpx
 
-    monkeypatch.setenv("HF_API_KEY", "test-key")
+    account_id = "a" * 32
+    monkeypatch.setenv("Gemini_API_Key", "test-gemini-key")
+    monkeypatch.setenv("Cloudflare_key", "test-cloudflare-token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", account_id)
     user_token = agent_tools.active_user_id.set("fallback-image-user")
     image_bytes = BytesIO()
     Image.new("RGB", (2, 2), color="blue").save(image_bytes, format="PNG")
-    requested_models = []
-
-    class FakeResponse:
-        headers = {"content-type": "application/json"}
-
-        def __init__(self, status_code):
-            self.status_code = status_code
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                request = httpx.Request("POST", agent_tools.HF_IMAGE_URL)
-                response = httpx.Response(self.status_code, request=request)
-                raise httpx.HTTPStatusError(
-                    f"HTTP {self.status_code}",
-                    request=request,
-                    response=response,
-                )
-
-        def json(self):
-            return {
-                "data": [{
-                    "b64_json": base64.b64encode(image_bytes.getvalue()).decode()
-                }]
-            }
+    calls = []
 
     def fake_post(url, **kwargs):
-        model = kwargs["json"]["model"]
-        requested_models.append(model)
-        return FakeResponse(429 if model == agent_tools.HF_IMAGE_MODELS[0] else 200)
+        calls.append((url, kwargs))
+        if url == agent_tools.GEMINI_IMAGE_URL:
+            return _provider_response(
+                url, gemini_payload, status_code=gemini_status_code
+            )
+        return _provider_response(
+            url,
+            {
+                "success": True,
+                "result": {"image": base64.b64encode(image_bytes.getvalue()).decode()},
+            },
+        )
 
     monkeypatch.setattr(agent_tools.httpx, "post", fake_post)
     monkeypatch.setattr(agent_tools, "emit_tool_event", lambda *args, **kwargs: None)
@@ -228,71 +251,132 @@ def test_generate_image_retries_schnell_after_dev_failure(image_api, monkeypatch
         agent_tools.active_user_id.reset(user_token)
 
     assert result.startswith(agent_tools.GENERATED_IMAGE_MARKER)
-    assert requested_models == list(agent_tools.HF_IMAGE_MODELS)
+    assert [call[0] for call in calls] == [
+        agent_tools.GEMINI_IMAGE_URL,
+        agent_tools.CLOUDFLARE_IMAGE_URL.format(
+            account_id=account_id,
+            model=agent_tools.CLOUDFLARE_IMAGE_MODEL,
+        ),
+    ]
+    assert calls[1][1]["headers"]["Authorization"] == "Bearer test-cloudflare-token"
+    assert calls[1][1]["json"] == {"prompt": "A blue cat"}
+    image_path = (
+        agent_tools.get_generated_image_dir("fallback-image-user")
+        / result.removeprefix(agent_tools.GENERATED_IMAGE_MARKER)
+    )
+    with Image.open(image_path) as saved:
+        assert saved.size == (2, 2)
 
 
-def test_generate_image_returns_plain_message_when_both_models_fail(image_api, monkeypatch):
-    _, _, agent_tools = image_api
-    import httpx
-
-    monkeypatch.setenv("HF_API_KEY", "test-key")
-    requested_models = []
-
-    def fake_post(url, **kwargs):
-        requested_models.append(kwargs["json"]["model"])
-        request = httpx.Request("POST", url)
-        response = httpx.Response(404, request=request)
-        raise httpx.HTTPStatusError("Not found", request=request, response=response)
-
-    def fake_get(url, **kwargs):
-        request = httpx.Request("GET", url)
-        response = httpx.Response(404, request=request)
-        raise httpx.HTTPStatusError("Not found", request=request, response=response)
-
-    monkeypatch.setattr(agent_tools.httpx, "post", fake_post)
-    monkeypatch.setattr(agent_tools.httpx, "get", fake_get)
-    monkeypatch.setattr(agent_tools, "emit_tool_event", lambda *args, **kwargs: None)
-
-    result = agent_tools.generate_image.func("A cat")
-
-    assert requested_models == list(agent_tools.HF_IMAGE_MODELS)
-    assert result == "Image generation error: image service returned status 404."
-
-
-def test_generate_image_falls_back_to_pollinations_after_hugging_face_404(
+def test_generate_image_does_not_fallback_for_gemini_bad_request(
     image_api, monkeypatch
 ):
     _, _, agent_tools = image_api
-    import httpx
+
+    monkeypatch.setenv("Gemini_API_Key", "test-gemini-key")
+    monkeypatch.setenv("Cloudflare_key", "test-cloudflare-token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "d" * 32)
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        return _provider_response(url, {}, status_code=400)
+
+    monkeypatch.setattr(agent_tools.httpx, "post", fake_post)
+    monkeypatch.setattr(agent_tools, "emit_tool_event", lambda *args, **kwargs: None)
+    user_token = agent_tools.active_user_id.set("bad-request-user")
+    try:
+        result = agent_tools.generate_image.func("A cat")
+    finally:
+        agent_tools.active_user_id.reset(user_token)
+
+    assert calls == [agent_tools.GEMINI_IMAGE_URL]
+    assert result == "Image generation error: image service returned status 400."
+
+
+def test_generate_image_reports_missing_cloudflare_account_id(
+    image_api, monkeypatch
+):
+    _, _, agent_tools = image_api
+    monkeypatch.setenv("Gemini_API_Key", "test-gemini-key")
+    monkeypatch.setenv("Cloudflare_key", "test-cloudflare-token")
+    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
+    monkeypatch.setattr(
+        agent_tools.httpx,
+        "post",
+        lambda url, **kwargs: _provider_response(url, {}, status_code=429),
+    )
+    monkeypatch.setattr(agent_tools, "emit_tool_event", lambda *args, **kwargs: None)
+    user_token = agent_tools.active_user_id.set("missing-account-id-user")
+    try:
+        result = agent_tools.generate_image.func("A cat")
+    finally:
+        agent_tools.active_user_id.reset(user_token)
+
+    assert "requires CLOUDFLARE_ACCOUNT_ID" in result
+
+
+def test_generate_image_returns_plain_message_when_both_providers_fail(
+    image_api, monkeypatch
+):
+    _, _, agent_tools = image_api
+
+    account_id = "b" * 32
+    monkeypatch.setenv("Gemini_API_Key", "test-gemini-key")
+    monkeypatch.setenv("Cloudflare_key", "test-cloudflare-token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", account_id)
+    user_token = agent_tools.active_user_id.set("both-providers-fail-user")
+    requested_urls = []
+
+    def fake_post(url, **kwargs):
+        requested_urls.append(url)
+        return _provider_response(url, {}, status_code=429 if len(requested_urls) == 1 else 503)
+
+    monkeypatch.setattr(agent_tools.httpx, "post", fake_post)
+    monkeypatch.setattr(agent_tools, "emit_tool_event", lambda *args, **kwargs: None)
+
+    try:
+        result = agent_tools.generate_image.func("A cat")
+    finally:
+        agent_tools.active_user_id.reset(user_token)
+
+    assert requested_urls == [
+        agent_tools.GEMINI_IMAGE_URL,
+        agent_tools.CLOUDFLARE_IMAGE_URL.format(
+            account_id=account_id,
+            model=agent_tools.CLOUDFLARE_IMAGE_MODEL,
+        ),
+    ]
+    assert result == "Image generation error: image service returned status 503."
+
+
+def test_generate_image_uses_cloudflare_when_gemini_key_is_missing(
+    image_api, monkeypatch
+):
+    _, _, agent_tools = image_api
+    import base64
     from io import BytesIO
     from PIL import Image
 
-    monkeypatch.setenv("HF_API_KEY", "test-key")
-    user_token = agent_tools.active_user_id.set("pollinations-fallback-user")
+    account_id = "c" * 32
+    monkeypatch.setenv("Cloudflare_key", "test-cloudflare-token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", account_id)
+    user_token = agent_tools.active_user_id.set("cloudflare-only-user")
     image_bytes = BytesIO()
     Image.new("RGB", (2, 2), color="green").save(image_bytes, format="JPEG")
-    requested_models = []
-    fallback_calls = []
+    calls = []
 
     def fake_post(url, **kwargs):
-        requested_models.append(kwargs["json"]["model"])
-        request = httpx.Request("POST", url)
-        response = httpx.Response(404, request=request)
-        raise httpx.HTTPStatusError("Not found", request=request, response=response)
-
-    class FakeImageResponse:
-        headers = {"content-type": "image/jpeg"}
-        content = image_bytes.getvalue()
-
-        def raise_for_status(self):
-            return None
-
-    def fake_get(url, **kwargs):
-        fallback_calls.append((url, kwargs))
-        return FakeImageResponse()
+        calls.append((url, kwargs))
+        return _provider_response(
+            url,
+            {
+                "success": True,
+                "result": {"image": base64.b64encode(image_bytes.getvalue()).decode()},
+            },
+        )
 
     monkeypatch.setattr(agent_tools.httpx, "post", fake_post)
-    monkeypatch.setattr(agent_tools.httpx, "get", fake_get)
     monkeypatch.setattr(agent_tools, "emit_tool_event", lambda *args, **kwargs: None)
     try:
         result = agent_tools.generate_image.func("A green cat")
@@ -300,41 +384,41 @@ def test_generate_image_falls_back_to_pollinations_after_hugging_face_404(
         agent_tools.active_user_id.reset(user_token)
 
     assert result.startswith(agent_tools.GENERATED_IMAGE_MARKER)
-    assert requested_models == list(agent_tools.HF_IMAGE_MODELS)
-    assert fallback_calls[0][0].startswith(agent_tools.POLLINATIONS_IMAGE_URL)
+    assert len(calls) == 1
+    assert calls[0][0] == agent_tools.CLOUDFLARE_IMAGE_URL.format(
+        account_id=account_id,
+        model=agent_tools.CLOUDFLARE_IMAGE_MODEL,
+    )
+    assert calls[0][1]["json"] == {"prompt": "A green cat"}
     saved_path = (
-        agent_tools.get_generated_image_dir("pollinations-fallback-user")
+        agent_tools.get_generated_image_dir("cloudflare-only-user")
         / result.removeprefix(agent_tools.GENERATED_IMAGE_MARKER)
     )
     with Image.open(saved_path) as saved:
         assert saved.size == (2, 2)
 
 
-def test_generate_image_without_hugging_face_key_is_plain_and_skips_request(
+def test_generate_image_without_provider_keys_returns_configuration_error(
     image_api, monkeypatch
 ):
     _, _, agent_tools = image_api
-    monkeypatch.delenv("HF_API_KEY", raising=False)
-    monkeypatch.delenv("HF_API_TOKEN", raising=False)
     monkeypatch.setattr(
         agent_tools.httpx,
         "post",
         lambda *args, **kwargs: pytest.fail("HTTP request should not be made without a key"),
     )
-
-    import httpx
-
-    def failed_pollinations(url, **kwargs):
-        request = httpx.Request("GET", url)
-        response = httpx.Response(503, request=request)
-        raise httpx.HTTPStatusError("Unavailable", request=request, response=response)
-
-    monkeypatch.setattr(agent_tools.httpx, "get", failed_pollinations)
     monkeypatch.setattr(agent_tools, "emit_tool_event", lambda *args, **kwargs: None)
 
-    result = agent_tools.generate_image.func("A cat")
+    user_token = agent_tools.active_user_id.set("no-provider-user")
+    try:
+        result = agent_tools.generate_image.func("A cat")
+    finally:
+        agent_tools.active_user_id.reset(user_token)
 
-    assert result == "Image generation error: image service returned status 503."
+    assert result == (
+        "Image generation error: RuntimeError: Image generation is not configured. "
+        "Set Gemini_API_Key or configure Cloudflare Workers AI."
+    )
 
 
 @pytest.mark.parametrize(

@@ -10,7 +10,10 @@ from fastapi.testclient import TestClient
 def voice_client(monkeypatch, tmp_path):
     monkeypatch.setenv("UI_DB_PATH", str(tmp_path / "ui.sqlite"))
     monkeypatch.setenv("UPLOAD_DIR", str(tmp_path / "upload"))
-    monkeypatch.setenv("SESSION_SECRET", "test-voice-session-secret")
+    monkeypatch.setenv(
+        "SESSION_SECRET",
+        "test-only-session-secret-that-is-long-enough-123456",
+    )
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
     monkeypatch.setenv("CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.sqlite"))
     monkeypatch.setenv("GROQ_API_KEY", "gsk_test_mock_key")
@@ -70,7 +73,7 @@ def test_voice_transcribe_oversize(voice_client):
     large_data = b"x" * (10 * 1024 * 1024 + 1)
     files = {"audio": ("test.webm", large_data, "audio/webm")}
     res = client.post("/voice/transcribe", files=files, headers=headers)
-    assert res.status_code == 400
+    assert res.status_code == 413
     assert "limit" in res.json()["detail"].lower() or "10 mb" in res.json()["detail"].lower()
 
 
@@ -87,6 +90,55 @@ def test_voice_transcribe_success(voice_client, monkeypatch):
     res = client.post("/voice/transcribe", files=files, headers=headers)
     assert res.status_code == 200
     assert res.json() == {"text": "Hello, this is a transcribed voice message."}
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type"),
+    [
+        ("recording.ogg", "audio/ogg;codecs=opus"),
+        ("recording.mp4", "audio/mp4"),
+    ],
+)
+def test_voice_transcribe_accepts_browser_audio_formats(
+    voice_client, monkeypatch, filename, content_type
+):
+    client, _ = voice_client
+    headers = _auth_headers(client)
+    import agent.voice as agent_voice
+
+    mock_groq = MagicMock()
+    mock_groq.return_value.audio.transcriptions.create.return_value = "Recognized speech."
+    monkeypatch.setattr(agent_voice, "Groq", mock_groq)
+
+    response = client.post(
+        "/voice/transcribe",
+        files={"audio": (filename, b"recorded-audio", content_type)},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"text": "Recognized speech."}
+
+
+def test_voice_transcribe_rejects_empty_provider_transcript(
+    voice_client, monkeypatch
+):
+    client, _ = voice_client
+    headers = _auth_headers(client)
+    import agent.voice as agent_voice
+
+    mock_groq = MagicMock()
+    mock_groq.return_value.audio.transcriptions.create.return_value = " "
+    monkeypatch.setattr(agent_voice, "Groq", mock_groq)
+
+    response = client.post(
+        "/voice/transcribe",
+        files={"audio": ("recording.webm", b"recorded-audio", "audio/webm")},
+        headers=headers,
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "An unexpected upstream error occurred."
 
 
 def test_voice_transcribe_groq_failure(voice_client, monkeypatch):

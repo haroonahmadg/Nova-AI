@@ -29,13 +29,17 @@ from datetime import date
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from filelock import Timeout as FileLockTimeout
+from pydantic import ValidationError as PydanticValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import ClientDisconnect
 
 from agent.graph import (
     get_all_saved_threads,
@@ -51,6 +55,7 @@ from agent.tools import (
     get_generated_image_dir,
 )
 from agent.voice import text_to_speech, transcribe_audio
+from database.db import initialize_database
 from rag.ingest import ingest_file, progress_context
 
 from api.config import (
@@ -131,9 +136,161 @@ logger = logging.getLogger(__name__)
 MAX_UPLOAD_REQUEST_BYTES = int(
     (MAX_FILE_MB * MAX_UPLOAD_FILES + 1) * 1024 * 1024
 )
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
+MAX_AUDIO_REQUEST_BYTES = MAX_AUDIO_BYTES + 64 * 1024
 
 
-def _upload_content_length_error(content_length: str | None) -> tuple[int, str] | None:
+class AudioRequestBodyLimitMiddleware:
+    """Buffer and bound voice uploads before multipart parsing."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/voice/transcribe"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                await self._reject(send, 400, "The audio upload has an invalid content length.")
+                return
+            if declared_size < 0:
+                await self._reject(send, 400, "The audio upload has an invalid content length.")
+                return
+            if declared_size > self.max_bytes:
+                await self._reject(send, 413, "The audio request exceeds the maximum allowed size.")
+                return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > self.max_bytes:
+                await self._reject(send, 413, "The audio request exceeds the maximum allowed size.")
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        body_bytes = bytes(body)
+        replayed = False
+
+        async def receive_with_body():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {
+                    "type": "http.request",
+                    "body": body_bytes,
+                    "more_body": False,
+                }
+            return await receive()
+
+        await self.app(scope, receive_with_body, send)
+
+    @staticmethod
+    async def _reject(send, status_code: int, detail: str) -> None:
+        body = ('{"detail":"' + detail + '"}').encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+class UploadRequestBodyLimitMiddleware:
+    """Bound multipart upload bodies even when Content-Length is absent."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/files/upload"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                await AudioRequestBodyLimitMiddleware._reject(
+                    send, 400, "The upload request has an invalid content length."
+                )
+                return
+            if declared_size < 0:
+                await AudioRequestBodyLimitMiddleware._reject(
+                    send, 400, "The upload request has an invalid content length."
+                )
+                return
+            if declared_size > self.max_bytes:
+                await AudioRequestBodyLimitMiddleware._reject(
+                    send, 413, "The total upload size exceeds the allowed limit."
+                )
+                return
+
+        received_bytes = 0
+        exceeded = False
+
+        async def limited_receive():
+            nonlocal received_bytes, exceeded
+            if exceeded:
+                return {"type": "http.disconnect"}
+
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > self.max_bytes:
+                    exceeded = True
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def limited_send(message):
+            if not exceeded:
+                await send(message)
+
+        try:
+            await self.app(scope, limited_receive, limited_send)
+        except ClientDisconnect:
+            if not exceeded:
+                raise
+
+        if exceeded:
+            await AudioRequestBodyLimitMiddleware._reject(
+                send, 413, "The total upload size exceeds the allowed limit."
+            )
+
+
+def _upload_content_length_error(
+    content_length: str | None,
+    *,
+    max_bytes: int = MAX_UPLOAD_REQUEST_BYTES,
+    too_large_detail: str = "The total upload size exceeds the allowed limit.",
+) -> tuple[int, str] | None:
     if content_length is None:
         return None
     try:
@@ -142,9 +299,66 @@ def _upload_content_length_error(content_length: str | None) -> tuple[int, str] 
         return 400, "The upload request has an invalid content length."
     if request_size < 0:
         return 400, "The upload request has an invalid content length."
-    if request_size > MAX_UPLOAD_REQUEST_BYTES:
-        return 413, "The total upload size exceeds the allowed limit."
+    if request_size > max_bytes:
+        return 413, too_large_detail
     return None
+
+
+async def _read_limited_request_body(request: Request, max_bytes: int) -> bytes:
+    """Read a request body without buffering beyond its configured limit."""
+
+    if max_bytes < 0:
+        raise ValueError("max_bytes must not be negative.")
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="The request has an invalid content length."
+            ) from exc
+        if declared_size < 0:
+            raise HTTPException(
+                status_code=400, detail="The request has an invalid content length."
+            )
+        if declared_size > max_bytes:
+            raise HTTPException(
+                status_code=413, detail="The request body exceeds the allowed limit."
+            )
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            raise HTTPException(
+                status_code=413, detail="The request body exceeds the allowed limit."
+            )
+        body.extend(chunk)
+
+    return bytes(body)
+
+
+async def _read_limited_upload(upload: UploadFile, max_bytes: int) -> bytes:
+    """Read at most max_bytes plus one byte to detect an oversized upload."""
+
+    if max_bytes < 0:
+        raise ValueError("max_bytes must not be negative.")
+    return await upload.read(max_bytes + 1)
+
+
+def _max_send_message_request_bytes() -> int:
+    """Bound JSON buffering while allowing configured text and image limits."""
+
+    max_image_bytes = int(MAX_IMAGE_MB * 1024 * 1024)
+    max_image_base64 = 4 * math.ceil(max_image_bytes / 3)
+    text_json_overhead = MAX_PROMPT_CHARS * 6
+    image_metadata_overhead = MAX_IMAGES_PER_REQUEST * 1024
+    return (
+        text_json_overhead
+        + MAX_IMAGES_PER_REQUEST * max_image_base64
+        + image_metadata_overhead
+        + 1024 * 1024
+    )
 
 
 # ============================================================
@@ -156,6 +370,7 @@ async def lifespan(app: FastAPI):
     # Mirrors app.py's main(): safe to call repeatedly, migrates an
     # older ui.sqlite if needed.
     try:
+        initialize_database()
         initialize_ui_database()
     except Exception as exc:
         raise RuntimeError(
@@ -183,6 +398,7 @@ app = FastAPI(title="AI Assistant API", lifespan=lifespan)
 
 _PUBLIC_PATHS = {
     "/health",
+    "/config/limits",
     "/auth/google",
     "/auth/register",
     "/auth/login",
@@ -234,6 +450,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
             if size_error:
                 status_code, detail = size_error
                 return JSONResponse({"detail": detail}, status_code=status_code)
+        elif path == "/voice/transcribe":
+            size_error = _upload_content_length_error(
+                request.headers.get("content-length"),
+                max_bytes=MAX_AUDIO_REQUEST_BYTES,
+                too_large_detail=(
+                    "The audio request exceeds the maximum allowed size."
+                ),
+            )
+            if size_error:
+                status_code, detail = size_error
+                return JSONResponse({"detail": detail}, status_code=status_code)
 
         return await call_next(request)
 
@@ -243,7 +470,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
 # AuthMiddleware (401s) also get CORS headers. If auth were outermost,
 # the browser would block every 401 as a CORS error and the frontend
 # would report "backend not working" instead of "please log in".
+app.add_middleware(
+    AudioRequestBodyLimitMiddleware,
+    max_bytes=MAX_AUDIO_REQUEST_BYTES,
+)
+
 app.add_middleware(AuthMiddleware)
+
+app.add_middleware(
+    UploadRequestBodyLimitMiddleware,
+    max_bytes=MAX_UPLOAD_REQUEST_BYTES,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -482,6 +719,11 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/config/limits")
+def public_limits() -> dict[str, int]:
+    return {"max_prompt_chars": MAX_PROMPT_CHARS}
+
+
 # ============================================================
 # THREADS
 # ============================================================
@@ -693,9 +935,17 @@ def get_messages(thread_id: str, request: Request) -> list[MessageOut]:
         raise HTTPException(status_code=400, detail="A valid thread_id is required.")
 
     try:
+        if thread_id in get_deleted_threads(user_id):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
         history = get_thread_history(thread_id=thread_id, user_id=user_id)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Could not load thread history: {exc}") from exc
+        logger.exception("Could not load conversation history.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not load conversation history right now.",
+        ) from exc
 
     return [MessageOut(**message) for message in history]
 
@@ -713,8 +963,12 @@ def delete_thread_endpoint(thread_id: str, request: Request) -> DeleteThreadResp
     # other users' threads).
     try:
         owned_threads = get_all_saved_threads(user_id)
-    except Exception:
-        owned_threads = {}
+    except Exception as exc:
+        logger.exception("Could not verify thread ownership before deletion.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not verify the conversation before deleting it.",
+        ) from exc
 
     if thread_id not in owned_threads:
         return DeleteThreadResponse(deleted=True, cleanup_warning=None)
@@ -829,6 +1083,18 @@ def edit_last_message(thread_id: str, request: Request) -> EditResponse:
     if not thread_id.strip():
         raise HTTPException(status_code=400, detail="A valid thread_id is required.")
 
+    try:
+        if thread_id in get_deleted_threads(request.state.user_id):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not verify the conversation before editing.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not verify the conversation right now.",
+        ) from exc
+
     removed = remove_last_turn(
         thread_id=thread_id,
         user_id=request.state.user_id,
@@ -846,6 +1112,18 @@ def export_thread(thread_id: str, request: Request) -> Response:
 
     user_id = request.state.user_id
     try:
+        if thread_id in get_deleted_threads(user_id):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not verify conversation deletion status.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not verify the conversation right now.",
+        ) from exc
+
+    try:
         owned_threads = get_all_saved_threads(user_id)
     except Exception as exc:
         raise HTTPException(
@@ -860,8 +1138,10 @@ def export_thread(thread_id: str, request: Request) -> Response:
             user_id=user_id,
         )
     except Exception as exc:
+        logger.exception("Could not load conversation history for export.")
         raise HTTPException(
-            status_code=500, detail=f"Could not load thread history: {exc}"
+            status_code=500,
+            detail="Could not load conversation history right now.",
         ) from exc
 
     title = get_renamed_titles(user_id).get(thread_id, owned_threads[thread_id])
@@ -902,23 +1182,21 @@ def export_thread(thread_id: str, request: Request) -> Response:
 # ============================================================
 
 @app.post("/threads/{thread_id}/messages/stream")
-def send_message_stream(
+async def send_message_stream(
     thread_id: str,
-    request_body: SendMessageRequest,
     request: Request,
 ) -> StreamingResponse:
     """
     Send a message and stream the reply as Server-Sent Events.
 
     Event types:
-      "text"     — {"text": "..."} incremental/final assistant text,
-                   from the "updates" stream_mode (same payload shape
-                   app.py's extract_streamed_ai_text already parses).
+      "text"     — {"text": "..."} incremental assistant tokens from
+                   "messages", with an "updates" fallback for nodes that
+                   did not emit message tokens.
       "image"    — {"url": "/generated-images/<file>"} an image made
                    by the generate_image tool.
-      "activity" — {"message": "..."} live tool/ingestion activity,
-                   from the "custom" stream_mode (agent.tools'/
-                   rag.ingest's emit_*_event calls).
+      "activity" — {"message": "Thinking..."} generic activity from the
+                   "custom" stream_mode; tool-specific labels stay private.
       "done"     — {} the turn finished normally.
       "error"    — {"message": "..."} something failed; no more events
                    follow.
@@ -928,6 +1206,26 @@ def send_message_stream(
 
     if not thread_id.strip():
         raise HTTPException(status_code=400, detail="A valid thread_id is required.")
+
+    try:
+        if thread_id in get_deleted_threads(user_id):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not verify conversation state before sending a message.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not verify the conversation right now.",
+        ) from exc
+
+    body = await _read_limited_request_body(
+        request, _max_send_message_request_bytes()
+    )
+    try:
+        request_body = SendMessageRequest.model_validate_json(body)
+    except PydanticValidationError as exc:
+        raise RequestValidationError(exc.errors(), body=body) from exc
 
     content = (request_body.content or "").strip()
 
@@ -1050,11 +1348,14 @@ def send_message_stream(
 
         try:
             citations: dict[tuple[str, int | None], dict[str, object]] = {}
+            web_citations: dict[str, dict[str, object]] = {}
+            streamed_text_nodes: set[str] = set()
             for stream_mode, chunk in stream_agent(
                 user_id=user_id,
                 messages=[agent_message],
                 thread_id=thread_id,
                 research_mode=request_body.research_mode,
+                stream_tokens=True,
             ):
 
                 if stream_mode == "custom":
@@ -1066,6 +1367,34 @@ def send_message_stream(
                     if isinstance(chunk, dict) and chunk.get("event") == "citation":
                         citation = chunk.get("citation")
                         if isinstance(citation, dict):
+                            if citation.get("type") == "web":
+                                source_title = citation.get("title")
+                                source_url = citation.get("url")
+                                if (
+                                    isinstance(source_title, str)
+                                    and source_title.strip()
+                                    and isinstance(source_url, str)
+                                    and len(source_url) <= 2048
+                                ):
+                                    try:
+                                        parsed_url = urlsplit(source_url)
+                                        parsed_url.port
+                                        valid_url = (
+                                            parsed_url.scheme.lower()
+                                            in {"http", "https"}
+                                            and bool(parsed_url.hostname)
+                                            and parsed_url.username is None
+                                            and parsed_url.password is None
+                                        )
+                                    except ValueError:
+                                        valid_url = False
+                                    if valid_url:
+                                        web_citations[source_url] = {
+                                            "type": "web",
+                                            "title": source_title.strip()[:300],
+                                            "url": source_url,
+                                        }
+                                continue
                             source_file = citation.get("file")
                             page = citation.get("page")
                             preview = citation.get("preview")
@@ -1080,7 +1409,35 @@ def send_message_stream(
                         continue
                     label = extract_activity_message(chunk)
                     if label:
-                        yield format_sse("activity", {"message": label})
+                        yield format_sse("activity", {"message": "Thinking..."})
+                    continue
+
+                if stream_mode == "messages":
+                    if not isinstance(chunk, tuple) or len(chunk) != 2:
+                        continue
+                    message_chunk, metadata = chunk
+                    node_name = (
+                        metadata.get("langgraph_node")
+                        if isinstance(metadata, dict)
+                        else None
+                    )
+                    if node_name not in {"assistant", "research_synthesize"}:
+                        continue
+                    content = getattr(message_chunk, "content", "")
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = "".join(
+                            str(block.get("text", ""))
+                            for block in content
+                            if isinstance(block, dict)
+                            and block.get("type") == "text"
+                        )
+                    else:
+                        text = ""
+                    if text:
+                        streamed_text_nodes.add(node_name)
+                        yield format_sse("text", {"text": text})
                     continue
 
                 # stream_mode == "updates"
@@ -1091,12 +1448,23 @@ def send_message_stream(
                     )
                     continue
 
+                text_node = next(
+                    (
+                        node_name
+                        for node_name in ("assistant", "research_synthesize")
+                        if isinstance(chunk, dict) and node_name in chunk
+                    ),
+                    None,
+                )
+                if text_node in streamed_text_nodes:
+                    continue
                 text = extract_updates_text(chunk)
                 if text:
                     yield format_sse("text", {"text": text})
 
-            if citations:
-                yield format_sse("citations", {"items": list(citations.values())})
+            all_citations = [*citations.values(), *web_citations.values()]
+            if all_citations:
+                yield format_sse("citations", {"items": all_citations})
             yield format_sse("done", {})
 
         except Exception:
@@ -1211,18 +1579,30 @@ async def upload_files(
         raise HTTPException(status_code=status_code, detail=detail)
 
     results: list[UploadedFileResult] = []
+    max_file_bytes = int(MAX_FILE_MB * 1024 * 1024)
 
     for uploaded_file in files:
 
         filename = uploaded_file.filename or "uploaded-file"
 
         try:
-            file_bytes = await uploaded_file.read()
+            file_bytes = await _read_limited_upload(
+                uploaded_file, max_file_bytes
+            )
         except Exception as exc:
             results.append(
                 UploadedFileResult(
                     filename=filename,
                     error=f"Could not read the upload: {exc}",
+                )
+            )
+            continue
+
+        if len(file_bytes) > max_file_bytes:
+            results.append(
+                UploadedFileResult(
+                    filename=filename,
+                    error=f"File '{filename}' exceeds maximum limit of {MAX_FILE_MB:g} MB.",
                 )
             )
             continue
@@ -1322,28 +1702,42 @@ async def upload_files(
 
 ALLOWED_AUDIO_MIME_TYPES = {
     "audio/webm",
+    "audio/ogg",
+    "audio/oga",
+    "audio/mp4",
+    "audio/m4a",
     "audio/mpeg",
     "audio/wav",
     "audio/x-wav",
     "audio/mp3",
 }
-ALLOWED_AUDIO_EXTENSIONS = {".webm", ".mp3", ".mpeg", ".wav"}
-MAX_AUDIO_BYTES = 10 * 1024 * 1024
-
-
+ALLOWED_AUDIO_EXTENSIONS = {
+    ".webm",
+    ".ogg",
+    ".oga",
+    ".mp4",
+    ".m4a",
+    ".mp3",
+    ".mpeg",
+    ".wav",
+}
 @app.post("/voice/transcribe", response_model=TranscribeResponse)
 async def voice_transcribe(audio: UploadFile = File(...)) -> TranscribeResponse:
     content_type = (audio.content_type or "").lower()
     suffix = Path(audio.filename or "").suffix.lower()
 
-    if content_type not in ALLOWED_AUDIO_MIME_TYPES and suffix not in ALLOWED_AUDIO_EXTENSIONS:
+    normalized_content_type = content_type.split(";", 1)[0].strip()
+    if (
+        normalized_content_type not in ALLOWED_AUDIO_MIME_TYPES
+        and suffix not in ALLOWED_AUDIO_EXTENSIONS
+    ):
         raise HTTPException(
             status_code=400,
-            detail="Unsupported audio format. Please upload webm, mpeg, or wav audio.",
+            detail="Unsupported audio format. Please use webm, ogg, mp4, mpeg, or wav audio.",
         )
 
     try:
-        audio_bytes = await audio.read()
+        audio_bytes = await _read_limited_upload(audio, MAX_AUDIO_BYTES)
     except Exception as exc:
         raise HTTPException(
             status_code=400, detail=f"Could not read the recording: {exc}"
@@ -1354,8 +1748,12 @@ async def voice_transcribe(audio: UploadFile = File(...)) -> TranscribeResponse:
 
     if len(audio_bytes) > MAX_AUDIO_BYTES:
         raise HTTPException(
-            status_code=400,
-            detail="Audio recording exceeds the 10 MB limit. Please record a shorter message.",
+            status_code=413,
+            detail=(
+                "Audio recording exceeds the "
+                f"{MAX_AUDIO_BYTES / (1024 * 1024):g} MB limit. "
+                "Please record a shorter message."
+            ),
         )
 
     filename = audio.filename or ("audio.webm" if "webm" in content_type else "audio.wav")
@@ -1379,6 +1777,13 @@ async def voice_transcribe(audio: UploadFile = File(...)) -> TranscribeResponse:
             status_code=502,
             detail="An unexpected upstream error occurred.",
         ) from exc
+
+    if not text.strip():
+        logger.warning("Speech transcription provider returned an empty transcript.")
+        raise HTTPException(
+            status_code=502,
+            detail="No speech was recognized. Please try recording again.",
+        )
 
     return TranscribeResponse(text=text)
 

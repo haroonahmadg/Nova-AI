@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from langchain_core.messages import HumanMessage
 
+import pytest
 from agent import graph
 
 
@@ -61,3 +62,31 @@ def test_codex_conversation_checkpoints_are_not_listed_as_chats(monkeypatch, tmp
     assert graph.get_all_saved_threads("user-1") == {
         "regular-chat": "Help with this task"
     }
+
+
+def test_thread_history_propagates_checkpoint_read_errors(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "checkpoints.sqlite"
+    checkpoint_path.touch()
+    monkeypatch.setattr(graph, "CHECKPOINT_DB_PATH", checkpoint_path)
+
+    class FakeCheckpointer:
+        def get_tuple(self, _config):
+            raise OSError("checkpoint unavailable")
+
+    class FakeConnection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    connection = FakeConnection()
+    monkeypatch.setattr(
+        graph,
+        "create_checkpointer",
+        lambda: (FakeCheckpointer(), connection),
+    )
+
+    with pytest.raises(OSError, match="checkpoint unavailable"):
+        graph.get_thread_history("user-1", "thread-1")
+
+    assert connection.closed

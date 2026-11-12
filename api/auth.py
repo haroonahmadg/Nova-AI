@@ -50,23 +50,41 @@ from api.store import (
 )
 
 
-def _require_configured() -> None:
-    if not GOOGLE_CLIENT_ID:
-        raise RuntimeError(
-            "GOOGLE_CLIENT_ID is not configured. Set it in your .env file "
-            "before starting the API."
-        )
-
+def _require_session_configured() -> None:
     if not SESSION_SECRET:
         raise RuntimeError(
             "SESSION_SECRET is not configured. Set it in your .env file "
-            "(any long random string) before starting the API."
+            "before authenticating."
+        )
+
+    if (
+        len(SESSION_SECRET) < 32
+        or SESSION_SECRET.casefold() == "change-me-to-a-long-random-string"
+    ):
+        raise RuntimeError(
+            "SESSION_SECRET must be a unique random value of at least 32 "
+            "characters. Generate one with "
+            "`python -c \"import secrets; print(secrets.token_urlsafe(48))\"`."
         )
 
     if SESSION_TTL_SECONDS <= 0:
         raise RuntimeError(
             "SESSION_TTL_SECONDS must be a positive number of seconds."
         )
+
+
+def _require_google_configured() -> None:
+    _require_session_configured()
+    if not GOOGLE_CLIENT_ID:
+        raise RuntimeError(
+            "GOOGLE_CLIENT_ID is not configured. Set it in your .env file "
+            "before using Google sign-in."
+        )
+
+
+def _require_configured() -> None:
+    """Keep the original Google-auth configuration check for compatibility."""
+    _require_google_configured()
 
 
 def verify_google_credential(credential: str) -> dict:
@@ -78,7 +96,7 @@ def verify_google_credential(credential: str) -> dict:
     to this app's GOOGLE_CLIENT_ID.
     """
 
-    _require_configured()
+    _require_google_configured()
 
     if not isinstance(credential, str) or not credential.strip():
         raise ValueError("A Google credential is required.")
@@ -110,7 +128,7 @@ def verify_google_credential(credential: str) -> dict:
 
 
 def _sign(payload: str) -> str:
-    _require_configured()
+    _require_session_configured()
 
     return hmac.new(
         SESSION_SECRET.encode("utf-8"),

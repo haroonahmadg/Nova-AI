@@ -2,40 +2,21 @@ import os
 import sqlite3
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
 # Configure logging for tracking database errors
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("database")
 
-DB_DIR = "data"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DB_DIR = str(Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data"))).resolve())
 DB_PATH = os.path.join(DB_DIR, "assistant.db")
 VALID_ROLES = {"user", "assistant", "system", "tool"}
 
 
-def _cleanup_wal_files() -> None:
-    """Remove WAL journal files when the database is being reset or deleted.
-
-    SQLite keeps -wal/-shm sidecars for WAL mode on Windows, and those files
-    can block os.remove() of the main database file while the process is still
-    using the DB. Cleaning them up on connection close keeps the app working on
-    Windows while preserving the expected WAL behavior.
-    """
-    for suffix in ("-wal", "-shm"):
-        wal_path = f"{DB_PATH}{suffix}"
-        try:
-            if os.path.exists(wal_path):
-                os.remove(wal_path)
-        except FileNotFoundError:
-            pass
-        except PermissionError:
-            # The file may still be in use by an active database connection.
-            # Leave it for the owning connection to clean up.
-            pass
-
-
 class SQLiteConnection:
-    """Small compatibility wrapper that cleans WAL sidecars when closed."""
+    """Small compatibility wrapper around a SQLite connection."""
 
     def __init__(self, connection: sqlite3.Connection):
         self._connection = connection
@@ -51,14 +32,7 @@ class SQLiteConnection:
         return False
 
     def close(self) -> None:
-        try:
-            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
-        try:
-            self._connection.close()
-        finally:
-            _cleanup_wal_files()
+        self._connection.close()
 
     def cursor(self):
         return self._connection.cursor()
@@ -86,6 +60,87 @@ def get_connection() -> SQLiteConnection:
     except Exception as e:
         logger.error(f"Failed to connect to database: {e}")
         raise RuntimeError(f"Database connection error: {e}")
+
+
+# Unassigned legacy rows stay NULL until the explicit data migration runs.
+_MEMORIES_CREATE_SQL = """
+    CREATE TABLE memories (
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        user_id TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (key, user_id)
+    )
+"""
+
+
+def _ensure_memories_table(connection: SQLiteConnection) -> None:
+    """Create or migrate the memories table while preserving existing rows."""
+
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+
+    try:
+        info = connection.execute("PRAGMA table_info(memories)").fetchall()
+
+        if not info:
+            connection.execute(_MEMORIES_CREATE_SQL)
+            connection.commit()
+            return
+
+        columns = {row[1] for row in info}
+        primary_key = [
+            row[1]
+            for row in sorted(
+                (row for row in info if row[5] > 0),
+                key=lambda row: row[5],
+            )
+        ]
+
+        if primary_key == ["key", "user_id"] and {
+            "key",
+            "value",
+            "user_id",
+        }.issubset(columns):
+            connection.commit()
+            return
+
+        if not {"key", "value"}.issubset(columns):
+            raise RuntimeError(
+                "The memories table is missing required key or value columns."
+            )
+
+        legacy_table = "memories_legacy_migration"
+        legacy_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (legacy_table,),
+        ).fetchone()
+        if legacy_exists:
+            raise RuntimeError(
+                f"Cannot migrate memories: table '{legacy_table}' already exists."
+            )
+
+        connection.execute(f"ALTER TABLE memories RENAME TO {legacy_table}")
+        connection.execute(_MEMORIES_CREATE_SQL)
+
+        copied_columns = [
+            column
+            for column in ("key", "value", "user_id", "updated_at")
+            if column in columns
+        ]
+        column_list = ", ".join(copied_columns)
+        connection.execute(
+            f"INSERT INTO memories ({column_list}) "
+            f"SELECT {column_list} FROM {legacy_table}"
+        )
+        connection.execute(f"DROP TABLE {legacy_table}")
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def initialize_database() -> None:
     """Sets up database tables with indexes for fast searching."""
     try:
@@ -114,32 +169,7 @@ def initialize_database() -> None:
                 )
             """)
             
-            # Long-term user memories table
-            # PRIMARY KEY is now (key, user_id) instead of just key, so the
-            # same fact-key ("favorite_color") can be stored independently
-            # per user instead of one person's memory overwriting another's.
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS memories (
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (key, user_id)
-                )
-            """)
-
-            # ------------------------------------------------------
-            # Migrate a pre-Stage-2 memories table (key-only PRIMARY
-            # KEY, no user_id column) by adding the column rather than
-            # dropping existing rows — they're left with user_id = NULL
-            # until scripts/migrate_existing_data.py assigns them.
-            # ------------------------------------------------------
-            memory_columns = {
-                row[1]
-                for row in cursor.execute("PRAGMA table_info(memories)").fetchall()
-            }
-            if "user_id" not in memory_columns:
-                cursor.execute("ALTER TABLE memories ADD COLUMN user_id TEXT")
+            _ensure_memories_table(conn)
             
             # Index for fast lookup of chat messages by thread
             cursor.execute("""

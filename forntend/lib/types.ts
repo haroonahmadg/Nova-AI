@@ -15,11 +15,20 @@ export type ThreadSummary = {
 
 export type ChatRole = "user" | "assistant";
 
-export type Citation = {
+export type DocumentCitation = {
+  type?: "document";
   file: string;
   page: number | null;
   preview: string;
 };
+
+export type WebCitation = {
+  type: "web";
+  title: string;
+  url: string;
+};
+
+export type Citation = DocumentCitation | WebCitation;
 
 export type ChatMessage = {
   id: string;
@@ -38,6 +47,10 @@ export type ThreadSummaryDTO = {
   title: string;
   pinned: boolean;
   archived: boolean;
+};
+
+export type PublicLimitsDTO = {
+  max_prompt_chars: number;
 };
 
 export type LoginResponseDTO = {

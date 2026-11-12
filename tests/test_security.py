@@ -58,3 +58,42 @@ def test_validate_file_security_oversized_file(tmp_path):
 
     with pytest.raises(ValueError, match="exceeds maximum limit"):
         validate_file_security(str(large_file))
+
+
+def test_validate_file_security_accepts_files_larger_than_legacy_limit(
+    tmp_path, monkeypatch
+):
+    import utils.security as security
+
+    monkeypatch.setattr(security, "MAX_FILE_SIZE_MB", 25.0)
+    monkeypatch.setattr(
+        security,
+        "MAX_FILE_SIZE_BYTES",
+        int(25 * 1024 * 1024),
+    )
+    large_file = tmp_path / "large.txt"
+    with open(large_file, "wb") as file:
+        file.truncate(11 * 1024 * 1024)
+
+    assert validate_file_security(str(large_file))
+
+
+def test_file_size_limit_uses_configured_environment_value(tmp_path, monkeypatch):
+    import importlib
+    import utils.limits as limits
+    import utils.security as security
+
+    original_value = os.environ.get("MAX_FILE_MB")
+    monkeypatch.setenv("MAX_FILE_MB", "12.5")
+    importlib.reload(limits)
+    security = importlib.reload(security)
+
+    assert security.MAX_FILE_SIZE_MB == 12.5
+    assert security.MAX_FILE_SIZE_BYTES == int(12.5 * 1024 * 1024)
+
+    if original_value is None:
+        monkeypatch.delenv("MAX_FILE_MB")
+    else:
+        monkeypatch.setenv("MAX_FILE_MB", original_value)
+    importlib.reload(limits)
+    importlib.reload(security)

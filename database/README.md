@@ -2,12 +2,15 @@
 
 `db.py` contains the SQLite helpers used for thread/message and long-term
 memory persistence, including schema initialization and compatibility
-migrations. The default database is `data/assistant.db`.
+migrations. The default database is `data/assistant.db`, under `DATA_DIR`
+when that setting is configured.
 
 The API also maintains account and UI metadata through `api/store.py`, and
 LangGraph keeps checkpoint state in its configured checkpoint database.
 These stores have different responsibilities; do not assume that deleting
-one database resets all application state.
+one database resets all application state. The UI database path can be
+overridden with `UI_DB_PATH`; the checkpoint database can be overridden with
+`CHECKPOINT_DB_PATH`.
 
 Local databases and their SQLite WAL sidecars are runtime data. Do not delete
 or replace them as a routine source cleanup. Back up the relevant files before

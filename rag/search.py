@@ -4,9 +4,7 @@ import pickle
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 
-
-FAISS_DIR = "data/faiss"
-METADATA_PATH = os.path.join(FAISS_DIR, "metadata.pkl")
+from rag.paths import FAISS_DIR, METADATA_PATH
 
 
 def search_pdf(
@@ -87,13 +85,32 @@ def search_pdf(
         # applying it so other users' nearest chunks don't hide this user's.
         raw_k = min(max(raw_k * 5, k * 5), 100)
 
-    candidates = vectorstore.similarity_search(query, k=raw_k)
-    documents = [
-        doc
-        for doc in candidates
-        if (not allowed_sources or doc.metadata.get("source") in allowed_sources)
-        and (user_id is None or doc.metadata.get("user_id") == user_id)
-    ][:k]
+    def is_in_scope(document) -> bool:
+        return (
+            (not allowed_sources or document.metadata.get("source") in allowed_sources)
+            and (user_id is None or document.metadata.get("user_id") == user_id)
+        )
+
+    try:
+        total_vectors = int(vectorstore.index.ntotal)
+    except (AttributeError, TypeError, ValueError):
+        total_vectors = None
+
+    if total_vectors is None:
+        candidates = vectorstore.similarity_search(query, k=raw_k)
+        documents = [document for document in candidates if is_in_scope(document)][:k]
+    else:
+        if total_vectors <= 0:
+            return []
+
+        search_k = min(raw_k, total_vectors)
+        documents = []
+        while True:
+            candidates = vectorstore.similarity_search(query, k=search_k)
+            documents = [document for document in candidates if is_in_scope(document)][:k]
+            if len(documents) >= k or search_k >= total_vectors:
+                break
+            search_k = min(total_vectors, max(search_k + 1, search_k * 2))
 
     results = []
 

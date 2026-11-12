@@ -5,9 +5,13 @@ import type { AuthUser, LoginResponseDTO, MeResponseDTO } from "@/lib/types";
 
 const TOKEN_STORAGE_KEY = "ai_assistant_session_token";
 const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+let memoryToken: string | null = null;
+let hasMemoryTokenOverride = false;
 
 function readStoredToken(): string | null {
+  if (hasMemoryTokenOverride) return memoryToken;
   if (typeof window === "undefined") return null;
   try {
     return window.localStorage.getItem(TOKEN_STORAGE_KEY);
@@ -17,6 +21,8 @@ function readStoredToken(): string | null {
 }
 
 function writeStoredToken(token: string | null) {
+  memoryToken = token;
+  hasMemoryTokenOverride = true;
   if (typeof window === "undefined") return;
   try {
     if (token) {
@@ -65,18 +71,32 @@ export function useAuth() {
 
   const ensureSessionUser = useCallback(async (token: string): Promise<boolean> => {
     try {
-      const res = await fetch(`${API_BASE_URL}/auth/me`, {
+      const request = () => fetch(`${API_BASE_URL}/auth/me`, {
         headers: { Authorization: `Bearer ${token}` },
       });
+      let res: Response;
+      try {
+        res = await request();
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        res = await request();
+      }
 
       if (!res.ok) {
-        clearSession();
+        if (res.status === 401) {
+          clearSession();
+        } else {
+          setIsAuthenticated(false);
+          setLoginError("Couldn't verify your saved session. Please try again.");
+        }
         return false;
       }
 
       const data = (await readJson<MeResponseDTO>(res)) as MeResponseDTO;
       if (!data?.email) {
-        clearSession();
+        setIsAuthenticated(false);
+        setLoginError("The server couldn't verify your saved session.");
         return false;
       }
 
@@ -88,14 +108,17 @@ export function useAuth() {
       setIsAuthenticated(true);
       return true;
     } catch {
-      clearSession();
+      setIsAuthenticated(false);
+      setLoginError("Couldn't reach the server to verify your saved session.");
       return false;
     }
   }, [clearSession]);
 
   useEffect(() => {
-    const token = readStoredToken();
+    const token = getStoredToken();
     if (!token) {
+      // Initialize authentication from browser storage after hydration.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIsAuthenticated(false);
       setUser(null);
       return;

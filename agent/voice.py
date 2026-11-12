@@ -12,30 +12,23 @@ def transcribe_audio(audio_bytes: bytes, filename: str = "recording.webm") -> st
     if not audio_bytes:
         raise ValueError("Audio buffer is empty.")
 
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(
             "GROQ_API_KEY is not configured in environment variables."
         )
 
-    client = Groq(api_key=api_key)
-
-    suffix = Path(filename).suffix or ".webm"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
-        temp_audio.write(audio_bytes)
-        temp_path = temp_audio.name
-
-    try:
-        with open(temp_path, "rb") as file:
-            transcription = client.audio.transcriptions.create(
-                file=(temp_path, file.read()),
-                model="whisper-large-v3-turbo",
-                response_format="text",
-            )
-        return str(transcription).strip()
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    client = Groq(api_key=api_key, timeout=60.0)
+    upload_name = Path(filename).name or "recording.webm"
+    transcription = client.audio.transcriptions.create(
+        file=(upload_name, audio_bytes),
+        model="whisper-large-v3-turbo",
+        response_format="text",
+    )
+    text = str(transcription).strip()
+    if not text:
+        raise RuntimeError("The transcription service returned no text.")
+    return text
 
 
 def _text_to_speech_groq(text: str, api_key: str) -> bytes:

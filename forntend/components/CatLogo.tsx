@@ -1,4 +1,5 @@
 import clsx from "clsx";
+import Image from "next/image";
 import { useState } from "react";
 
 export function CatLogo({
@@ -29,10 +30,12 @@ export function CatLogo({
           <path d="M11 17.25a1.25 1.25 0 1 0 0 2.5 1.25 1.25 0 0 0 0-2.5Zm10 0a1.25 1.25 0 1 0 0 2.5 1.25 1.25 0 0 0 0-2.5ZM16 21l-2 2h4l-2-2Z" className="fill-surface" />
         </svg>
       ) : (
-        <img
+        <Image
           src={src}
           alt=""
           aria-hidden="true"
+          width={32}
+          height={32}
           className="h-full w-full rounded-full object-contain"
           onError={() => setUseFallback(true)}
         />

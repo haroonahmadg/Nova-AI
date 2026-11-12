@@ -14,6 +14,8 @@ from typing import Annotated, Any, Generator, TypedDict
 
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -33,6 +35,7 @@ from langgraph.config import get_stream_writer
 from database.db import get_memories
 
 from rag.search import get_document_preview
+from utils.limits import MAX_IMAGES_PER_REQUEST
 
 from agent.tools import (
     calculator,
@@ -65,9 +68,6 @@ from agent.tools import (
 # ============================================================
 # ENVIRONMENT / CONFIGURATION
 # ============================================================
-
-load_dotenv()
-
 
 def get_env(name: str, default: str | None = None) -> str | None:
     """Read a value from environment variables."""
@@ -134,12 +134,13 @@ def get_vision_model_name() -> str:
 # long-term user memories.
 # ============================================================
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = Path(
+    get_env("DATA_DIR", str(PROJECT_ROOT / "data"))
+).resolve()
 CHECKPOINT_DB_PATH = Path(
-    get_env(
-        "CHECKPOINT_DB_PATH",
-        "data/checkpoints.sqlite",
-    )
-)
+    get_env("CHECKPOINT_DB_PATH", str(DATA_DIR / "checkpoints.sqlite"))
+).resolve()
 
 CHECKPOINT_DB_PATH.parent.mkdir(
     parents=True,
@@ -254,6 +255,7 @@ def get_llm(model_name: str | None = None) -> ChatGroq:
         temperature=temperature,
         api_key=api_key,
         max_tokens=max_tokens,
+        streaming=True,
         # Rate-limit retries are handled explicitly in assistant_node
         # (with a visible "retrying in Xs" activity event) instead of
         # being silently retried inside the SDK with no feedback to
@@ -294,7 +296,12 @@ always answer that you are Nova GPT.
 
 You are a helpful, intelligent, and direct AI assistant.
 
-Answer questions clearly and concisely using plain language.
+Answer clearly and directly in plain language. For explanations, use
+helpful headings, short paragraphs, and lists where they improve readability.
+Include concrete, real-world examples when they make an abstract idea easier
+to understand; do not add examples just to fill space. When discussing a
+technology or policy, cover relevant benefits, limitations, and societal
+trade-offs (such as job displacement or governance) in a balanced way.
 
 Use tools whenever they are appropriate.
 
@@ -321,6 +328,18 @@ IMPORTANT RULES:
 
 8. When any tool returns an error, tell the user the actual reason
    in plain words instead of a generic "service unreachable" message.
+
+9. Treat extraordinary, recent, medical, legal, financial, and other
+   consequential claims as unverified unless supported by reliable retrieved
+   evidence. Use web_search for current or extraordinary claims when
+   available. Clearly distinguish verified facts, allegations, and unknowns;
+   never present a headline or a single uncorroborated result as established
+   fact.
+
+10. Cite only sources actually returned by web_search or rag_search. Never
+    invent a publication, source name, URL, quotation, or citation. If a
+    search fails, returns no useful results, or the evidence is insufficient,
+    say so and qualify the answer rather than implying it was verified.
 """.strip()
 
     # --------------------------------------------------------
@@ -711,6 +730,8 @@ def research_plan_node(state: AgentState) -> dict[str, Any]:
     planner_prompt = (
         "You are a research planner. Analyze the user's question and break it down into 2 to 4 "
         "distinct, focused sub-questions or search queries required to investigate it thoroughly.\n"
+        "For extraordinary or consequential claims, include a query to verify the claim and, when "
+        "possible, a separate query for independent corroboration or authoritative context.\n"
         "Respond with ONLY a JSON list of strings, e.g.:\n"
         '["First sub-question", "Second sub-question", "Third sub-question"]\n'
         f"User question: {user_query or 'General inquiry'}"
@@ -790,8 +811,13 @@ def research_synthesize_node(state: AgentState) -> dict[str, Any]:
     synthesize_prompt = (
         f"{build_system_prompt()}\n\n"
         "You are Nova GPT in Research Mode. You have conducted research using tools. "
-        "Now synthesize the gathered information into a thorough, comprehensive, and grounded final answer. "
-        "Organize with clear structure, cite findings clearly, and address the user's initial inquiry."
+        "Synthesize only the evidence actually present in the tool results and conversation. "
+        "Use clear headings, concise paragraphs, and relevant concrete examples. For consequential "
+        "topics, distinguish confirmed evidence from allegations, uncertainty, and missing evidence; "
+        "include relevant benefits, limitations, and societal trade-offs without forcing irrelevant "
+        "sections. Cite only retrieved sources and never invent links, publications, quotes, or citations. "
+        "If tools failed or returned no usable sources, disclose that and do not claim independent verification. "
+        "Address the user's original question directly."
     )
 
     messages = [
@@ -935,6 +961,12 @@ def prepare_image_for_groq(
 
     try:
         with Image.open(BytesIO(image_bytes)) as source:
+            pixel_count = source.width * source.height
+            if pixel_count > MAX_IMAGE_PIXELS:
+                raise ValueError(
+                    "Image dimensions exceed the supported maximum of "
+                    f"{MAX_IMAGE_PIXELS:,} pixels."
+                )
             image = ImageOps.exif_transpose(source).convert("RGB")
 
             if max(image.size) > max_dimension:
@@ -976,15 +1008,25 @@ def prepare_image_for_groq(
                 "Image could not be reduced to a safe size for the vision model."
             )
 
+    except Image.DecompressionBombError as exc:
+        raise ValueError(
+            f"Image dimensions exceed the supported maximum of "
+            f"{MAX_IMAGE_PIXELS:,} pixels."
+        ) from exc
     except (OSError, ValueError) as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("Image could"):
             raise
         if isinstance(exc, ValueError) and str(exc) == "Image data is empty.":
             raise
+        if isinstance(exc, ValueError) and str(exc).startswith("Image dimensions"):
+            raise
         raise ValueError(
             "The uploaded image could not be decoded or processed. "
             "Please upload a valid PNG, JPG, JPEG, WEBP, or GIF image."
         ) from exc
+
+
+MAX_IMAGE_PIXELS = 25_000_000
 
 
 # ============================================================
@@ -1026,12 +1068,23 @@ def _extract_attached_filenames(
             if not isinstance(uploaded_file, dict):
                 continue
 
-            filename = uploaded_file.get("filename")
-
-            if isinstance(filename, str) and filename.strip():
-                filenames.append(filename.strip())
+            source_name = _attached_file_source_name(uploaded_file)
+            if source_name:
+                filenames.append(source_name)
 
     return filenames or None
+
+
+def _attached_file_source_name(uploaded_file: dict[str, Any]) -> str | None:
+    """Return the basename ingestion records as the document source."""
+    file_path = uploaded_file.get("file_path")
+    if isinstance(file_path, str) and file_path.strip():
+        return Path(file_path).name or None
+
+    filename = uploaded_file.get("filename")
+    if isinstance(filename, str) and filename.strip():
+        return filename.strip()
+    return None
 
 
 # ============================================================
@@ -1040,6 +1093,7 @@ def _extract_attached_filenames(
 
 def parse_input_messages(
     messages: list[dict[str, Any]],
+    user_id: str | None = None,
 ) -> list[BaseMessage]:
     """Convert Streamlit/API messages into LangChain messages.
 
@@ -1103,9 +1157,10 @@ def parse_input_messages(
                 if not isinstance(images, list):
                     raise ValueError("The images field must be a list.")
 
-                if len(images) > 3:
+                if len(images) > MAX_IMAGES_PER_REQUEST:
                     raise ValueError(
-                        "Groq currently supports a maximum of 3 images per request."
+                        "Groq currently supports a maximum of "
+                        f"{MAX_IMAGES_PER_REQUEST} images per request."
                     )
 
                 for index, image in enumerate(images, start=1):
@@ -1227,12 +1282,12 @@ def parse_input_messages(
 
                 if has_images_this_message:
 
-                    attached_filenames = [
-                        str(uploaded_file.get("filename") or "").strip()
-                        for uploaded_file in files
-                        if isinstance(uploaded_file, dict)
-                        and str(uploaded_file.get("filename") or "").strip()
-                    ]
+                    attached_filenames = []
+                    for uploaded_file in files:
+                        if isinstance(uploaded_file, dict):
+                            source_name = _attached_file_source_name(uploaded_file)
+                            if source_name:
+                                attached_filenames.append(source_name)
 
                     if attached_filenames:
 
@@ -1240,6 +1295,7 @@ def parse_input_messages(
                             preview_chunks = get_document_preview(
                                 attached_filenames,
                                 k=6,
+                                user_id=user_id,
                             )
                         except (FileNotFoundError, ValueError):
                             # Not yet indexed, or no metadata available —
@@ -1570,7 +1626,8 @@ def run_agent(
     """
 
     incoming_messages = parse_input_messages(
-        messages
+        messages,
+        user_id=user_id,
     )
 
     config = get_thread_config(user_id,
@@ -1649,6 +1706,7 @@ def stream_agent(
     messages: list[dict[str, Any]],
     thread_id: str,
     research_mode: bool = False,
+    stream_tokens: bool = False,
 ) -> Generator[
     tuple[str, dict[str, Any]],
     None,
@@ -1670,16 +1728,19 @@ def stream_agent(
             langgraph.config.get_stream_writer() — this is how
             agent.tools.emit_tool_event() (tool started/completed/error,
             and now also rate_limit_retry from assistant_node) and
-            rag.ingest.emit_ingest_event() reach the UI live, so the
-            person can see what the assistant/ingestion pipeline is
-            doing instead of watching a blank "thinking" state.
+            rag.ingest.emit_ingest_event() are exposed internally. The API
+            converts them to a generic status before sending them to clients.
+
+        When stream_tokens is true, also yields ("messages", (...))
+        token events from LangGraph for API-level incremental responses.
     """
 
     if not user_id or not str(user_id).strip():
         user_id = "local"
 
     incoming_messages = parse_input_messages(
-        messages
+        messages,
+        user_id=user_id,
     )
 
     config = get_thread_config(
@@ -1713,13 +1774,17 @@ def stream_agent(
         # Stream graph updates + custom activity events
         # ----------------------------------------------------
 
+        stream_modes = ["updates", "custom"]
+        if stream_tokens:
+            stream_modes.append("messages")
+
         for stream_mode, chunk in graph.stream(
             {
                 "messages": input_messages,
                 "research_mode": research_mode,
             },
             config=config,
-            stream_mode=["updates", "custom"],
+            stream_mode=stream_modes,
         ):
 
             yield stream_mode, chunk
@@ -1878,12 +1943,6 @@ def get_thread_history(
 
         return history
 
-    except Exception:
-
-        # A corrupted or unreadable checkpoint should degrade to
-        # "no history" rather than crash the caller.
-        return []
-
     finally:
 
         connection.close()
@@ -1893,9 +1952,9 @@ def get_thread_history(
 # THREAD TITLES
 #
 # A smarter local heuristic for naming a thread in the sidebar: strips
-# common filler phrases from the start of the first user message
-# rather than just truncating raw text. This is a local, no-extra-LLM
-# improvement — not a true AI-generated summary.
+# common filler phrases from the first meaningful user prompt, skipping
+# greeting-only messages. This is a local, no-extra-LLM improvement —
+# not a true AI-generated summary.
 # ============================================================
 
 _TITLE_FILLER_PHRASES = [
@@ -1913,6 +1972,29 @@ _TITLE_FILLER_PHRASES = [
     "hello",
 ]
 
+_GREETING_ONLY_PATTERN = re.compile(
+    r"^(?:hi|hello|hey|good morning|good afternoon|good evening)"
+    r"(?:\s+(?:there|everyone|nova|assistant))?[.!?,\s]*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_title_fillers(text: str) -> str:
+    cleaned = text.strip()
+    while cleaned:
+        for phrase in _TITLE_FILLER_PHRASES:
+            match = re.match(
+                rf"^{re.escape(phrase)}(?=$|[\s,.:!?])",
+                cleaned,
+                re.IGNORECASE,
+            )
+            if match:
+                cleaned = cleaned[match.end():].lstrip(" ,.:!?")
+                break
+        else:
+            return cleaned
+    return cleaned
+
 
 def _generate_thread_title(text: str, max_length: int = 40) -> str:
     """
@@ -1921,14 +2003,7 @@ def _generate_thread_title(text: str, max_length: int = 40) -> str:
     nothing usable.
     """
 
-    cleaned = text.strip()
-    lowered = cleaned.lower()
-
-    for phrase in _TITLE_FILLER_PHRASES:
-        if lowered.startswith(phrase):
-            cleaned = cleaned[len(phrase):].strip(" ,.:!?")
-            lowered = cleaned.lower()
-
+    cleaned = _strip_title_fillers(text)
     if not cleaned:
         cleaned = text.strip()
 
@@ -1989,16 +2064,26 @@ def get_all_saved_threads(
             messages = values.get("messages", [])
 
             first_user_message = None
+            has_user_message = False
+            has_text_message = False
 
             for message in messages:
                 if isinstance(message, HumanMessage):
+                    has_user_message = True
                     text = extract_message_text(message)
                     if text:
+                        has_text_message = True
+                        if _GREETING_ONLY_PATTERN.fullmatch(text.strip()):
+                            continue
                         first_user_message = text
                         break
 
-            if first_user_message:
-                threads[raw_thread_id] = _generate_thread_title(first_user_message)
+            if has_user_message:
+                threads[raw_thread_id] = (
+                    _generate_thread_title(first_user_message)
+                    if first_user_message
+                    else "New chat" if has_text_message else "Image conversation"
+                )
 
         return threads
 

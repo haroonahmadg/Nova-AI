@@ -1,13 +1,16 @@
 import os
 from pathlib import Path
 
+from utils.limits import MAX_FILE_MB
+
 # Updated whitelist including JPG, JPEG, and PNG image formats
 ALLOWED_EXTENSIONS = {
     ".pdf", ".csv", ".docx", ".doc", ".txt", ".md", ".json", ".py",
     ".jpg", ".jpeg", ".png",
     "",  # extensionless files are loaded as plain text by load_document()
 }
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_FILE_SIZE_MB = MAX_FILE_MB
+MAX_FILE_SIZE_BYTES = int(MAX_FILE_SIZE_MB * 1024 * 1024)
 
 
 def sanitize_path(file_path: str, base_dir: str = "data") -> Path:
@@ -63,8 +66,9 @@ def validate_file_security(file_path: str) -> bool:
         raise ValueError("File is empty.")
 
     if file_size > MAX_FILE_SIZE_BYTES:
-        max_mb = MAX_FILE_SIZE_BYTES // (1024 * 1024)
-        raise ValueError(f"File size exceeds maximum limit of {max_mb} MB.")
+        raise ValueError(
+            f"File size exceeds maximum limit of {MAX_FILE_SIZE_MB:g} MB."
+        )
 
     return True
 

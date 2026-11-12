@@ -12,6 +12,10 @@ responses.
 Use the user ID consistently when ingesting, searching, previewing, or
 deleting content. The FAISS index and metadata registry are generated runtime
 data and may contain user documents; preserve them during source cleanup.
+Document citations are emitted with the source filename, page, and a short
+preview. These are separate from web citations emitted by
+`agent.tools.web_search`; do not treat search-result URLs as RAG document
+metadata.
 
 See `tests/test_rag.py` and `tests/test_rag_citations.py` for focused coverage.
 Project setup and the full test command are in the [root README](../README.md).

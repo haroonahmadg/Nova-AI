@@ -21,6 +21,9 @@ The FastAPI API owns authentication, user-scoped thread operations, streamed
 responses, uploads, image/media endpoints, and voice endpoints. The agent
 orchestrates model and tool calls. RAG ingestion and search use a local
 FAISS index. SQLite and generated files live under `data/` by default.
+Assistant responses can include citations from uploaded documents and
+validated web-search results. Research mode is available from the chat input's
+Think toggle.
 
 The root `app.py` is a separate Streamlit interface, not the Next.js entry
 point. It is retained for compatibility and shares local storage paths with
@@ -107,15 +110,23 @@ npm run build
 
 Tests should use temporary databases, local fixtures, or mocked upstream
 services; do not run tests against production accounts or data directories.
+The test fixture reloads already-imported environment-dependent modules in
+place after setting per-test storage paths.
 
 ## Important runtime contracts
 
 - Keep authenticated data isolated by user across threads, uploads, memories,
   generated media, and retrieval.
 - Chat streaming uses server-sent events. Existing event types and payloads
-  are consumed by both clients; preserve their shapes when changing streaming.
-- The LangGraph agent contains research-mode routing, but the current Next.js
-  UI does not expose or send a research-mode toggle.
+  are consumed by both clients; preserve existing payloads and make new
+  citation fields additive.
+- Web citations are delivered as stream metadata; they are not currently
+  stored as standalone message metadata, so the structured source links may
+  not reappear when an older conversation is reloaded.
+- `GET /config/limits` is public and supplies the configured prompt character
+  limit to the Next.js client. The API remains authoritative for validation.
+- Research mode is selected through the chat input's Think toggle and routed
+  by the LangGraph agent.
 - Local SQLite databases, FAISS indexes, uploads, and generated media are
   runtime data, not source files. Back them up before migrations or manual
   cleanup.

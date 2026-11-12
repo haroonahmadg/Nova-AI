@@ -118,9 +118,9 @@ export function Sidebar({
   return (
     <aside className="flex h-full w-64 flex-shrink-0 flex-col border-r border-surface-border bg-surface">
       <div className="flex items-center justify-between px-3 py-3">
-        <span className="flex items-center gap-2 text-sm font-semibold tracking-wide">
+        <span className="flex items-center gap-2 text-lg font-semibold tracking-tight">
           <CatLogo className="h-7 w-7" />
-          <span>Nova AI</span>
+          <span>Nova GPT</span>
         </span>
         <div className="flex items-center gap-1">
           <IconButton aria-label="Search" onClick={() => setSearchOpen((p) => !p)}>
@@ -138,7 +138,7 @@ export function Sidebar({
             onNavigate("chat");
             onNewChat();
           }}
-          className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm text-white/90 hover:bg-surface-hover"
+          className="flex w-full items-center gap-2 rounded-xl bg-[#1c1c1c] px-3 py-3 text-sm text-white/90 transition-colors hover:bg-[#252525]"
         >
           <SquarePen size={16} />
           New chat
@@ -184,7 +184,7 @@ export function Sidebar({
           <p className="px-2 py-2 text-xs text-white/40">No conversations yet.</p>
         )}
         {!loading && !error && query && pinned.length === 0 && recent.length === 0 && archived.length === 0 && (
-          <p className="px-2 py-2 text-xs text-white/40">No chats match "{searchQuery}".</p>
+          <p className="px-2 py-2 text-xs text-white/40">No chats match &quot;{searchQuery}&quot;.</p>
         )}
         {!loading && !error && (
           <>

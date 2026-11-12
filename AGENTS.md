@@ -5,7 +5,7 @@
 
 ## Project purpose
 
-Cat GPT is a portfolio chat assistant built on FastAPI, LangGraph, FAISS-backed RAG, and a Next.js frontend. The assistant must self-identify as "Cat GPT" in the system prompt, and the app uses per-user isolation for threads, uploads, RAG indexes, and memory.
+Cat GPT is a portfolio chat assistant built on FastAPI, LangGraph, FAISS-backed RAG, and a Next.js frontend. The assistant's system prompt identifies it as "Nova GPT". The app uses per-user isolation for threads, uploads, RAG indexes, and memory.
 
 ## Current architecture
 
@@ -22,11 +22,16 @@ SSE event types currently emitted by the app are:
 - `text` — `{"text": "..."}`
 - `image` — `{"url": "/generated-images/<file>"}`
 - `activity` — `{"message": "..."}`
-- `citations` — `{"items": [{"file": str, "page": int | null, "preview": str}]}`
+- `plan` — `{"steps": [str, ...]}`
+- `citations` — `{"items": [...]}`; document items contain `file`, `page`,
+  and `preview`, while web items contain `type: "web"`, `title`, and a
+  validated HTTP(S) `url`.
 - `done` — `{}`
 - `error` — `{"message": "..."}`
 
 Clients must ignore unknown event types. Existing event shapes stay stable; new event types are additive only.
+Keep web citations sourced from actual search results; never synthesize source
+names or links from model output. Preserve document citation compatibility.
 
 ## Feature status
 
@@ -35,7 +40,8 @@ Implemented and in the codebase:
 - F3 export / print-to-PDF
 - F4 citations + sources panel
 - F5 voice input / Whisper transcription
-- Research-mode graph routing with `research_mode` state and plan/synthesis nodes; the current Next.js UI does not expose the toggle.
+- Research-mode graph routing with `research_mode` state and plan/synthesis
+  nodes; the chat input's Think toggle sends this option.
 
 ## Repo rules
 

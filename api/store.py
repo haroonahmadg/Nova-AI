@@ -13,7 +13,11 @@ import sqlite3
 import uuid
 
 from api.config import UI_DB_PATH
-from agent.graph import CHECKPOINT_DB_PATH, create_checkpointer
+from agent.graph import (
+    CHECKPOINT_DB_PATH,
+    create_checkpointer,
+    make_namespaced_thread_id,
+)
 
 
 def get_ui_connection() -> sqlite3.Connection:
@@ -860,8 +864,9 @@ def delete_thread(thread_id: str, user_id: str) -> tuple[bool, str | None]:
     except Exception as exc:
         return False, f"Could not mark the chat as deleted: {exc}"
 
+    namespaced_thread_id = make_namespaced_thread_id(user_id, thread_id)
     cleanup_ok, cleanup_error = permanently_delete_checkpoint_thread(
-        thread_id.strip()
+        namespaced_thread_id
     )
 
     return True, cleanup_error if not cleanup_ok else None

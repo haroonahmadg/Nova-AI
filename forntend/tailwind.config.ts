@@ -19,7 +19,7 @@ const config: Config = {
           border: "#2a2a2c",
         },
         accent: {
-          DEFAULT: "#4f8cff",
+          DEFAULT: "#3b82f6",
         },
       },
       borderRadius: {

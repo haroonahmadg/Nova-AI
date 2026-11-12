@@ -9,10 +9,17 @@ import { useAuth } from "@/lib/useAuth";
 
 export default function PrintThreadPage() {
   const { threadId } = useParams<{ threadId: string }>();
-  const [markdown, setMarkdown] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{
+    threadId: string;
+    markdown: string;
+    error: string | null;
+    loading: boolean;
+  }>({ threadId: "", markdown: "", error: null, loading: true });
   const { handleUnauthorized } = useAuth();
+  const currentResult = result.threadId === threadId ? result : null;
+  const markdown = currentResult?.markdown ?? "";
+  const loading = currentResult?.loading ?? true;
+  const error = currentResult?.error ?? null;
 
   useEffect(() => {
     setUnauthorizedHandler(handleUnauthorized);
@@ -20,19 +27,21 @@ export default function PrintThreadPage() {
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    setError(null);
     void fetchThreadExportMarkdown(threadId)
       .then((content) => {
-        if (!cancelled) setMarkdown(content);
+        if (!cancelled) {
+          setResult({ threadId, markdown: content, error: null, loading: false });
+        }
       })
       .catch((reason: unknown) => {
         if (!cancelled) {
-          setError(reason instanceof Error ? reason.message : "Could not load this transcript.");
+          setResult({
+            threadId,
+            markdown: "",
+            error: reason instanceof Error ? reason.message : "Could not load this transcript.",
+            loading: false,
+          });
         }
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
       });
     return () => {
       cancelled = true;

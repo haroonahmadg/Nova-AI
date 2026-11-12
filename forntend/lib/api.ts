@@ -2,6 +2,7 @@ import {
   ChatMessage,
   ThreadSummary,
   ThreadSummaryDTO,
+  PublicLimitsDTO,
   CreateThreadResponseDTO,
   MessageOutDTO,
   PinResponseDTO,
@@ -19,7 +20,7 @@ import {
 import { getStoredToken } from "./useAuth";
 
 const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 /**
  * Fired whenever any request comes back 401 (expired/invalid session),
@@ -61,6 +62,20 @@ async function handleJsonResponse<T>(res: Response): Promise<T> {
 
 function toThreadSummary(dto: ThreadSummaryDTO): ThreadSummary {
   return { threadId: dto.thread_id, title: dto.title, pinned: dto.pinned, archived: dto.archived };
+}
+
+export async function getPublicLimits(
+  signal?: AbortSignal,
+): Promise<PublicLimitsDTO> {
+  const res = await fetch(`${API_BASE_URL}/config/limits`, { signal });
+  const limits = await handleJsonResponse<PublicLimitsDTO>(res);
+  if (
+    !Number.isSafeInteger(limits.max_prompt_chars) ||
+    limits.max_prompt_chars <= 0
+  ) {
+    throw new Error("The server returned an invalid message limit.");
+  }
+  return limits;
 }
 
 function toChatMessage(dto: MessageOutDTO, index: number): ChatMessage {
@@ -278,15 +293,46 @@ function parseSseFrame(frame: string): StreamEvent | null {
       if (!Array.isArray(data.items)) return null;
       return {
         type: "citations",
-        items: data.items.filter(
-          (item): item is Citation =>
-            !!item &&
-            typeof item === "object" &&
-            typeof (item as Record<string, unknown>).file === "string" &&
-            ((item as Record<string, unknown>).page === null ||
-              typeof (item as Record<string, unknown>).page === "number") &&
-            typeof (item as Record<string, unknown>).preview === "string",
-        ),
+        items: data.items.flatMap((item): Citation[] => {
+          if (!item || typeof item !== "object") return [];
+          const citation = item as Record<string, unknown>;
+          if (
+            citation.type === "web" &&
+            typeof citation.title === "string" &&
+            typeof citation.url === "string"
+          ) {
+            try {
+              const url = new URL(citation.url);
+              if (
+                (url.protocol === "https:" || url.protocol === "http:") &&
+                !url.username &&
+                !url.password
+              ) {
+                return [{
+                  type: "web",
+                  title: citation.title.slice(0, 300),
+                  url: url.toString(),
+                }];
+              }
+            } catch {
+              return [];
+            }
+            return [];
+          }
+          if (
+            typeof citation.file === "string" &&
+            (citation.page === null || typeof citation.page === "number") &&
+            typeof citation.preview === "string"
+          ) {
+            return [{
+              type: "document",
+              file: citation.file,
+              page: citation.page,
+              preview: citation.preview,
+            }];
+          }
+          return [];
+        }),
       };
     case "plan":
       if (!Array.isArray(data.steps)) return null;
@@ -322,6 +368,7 @@ export function streamMessage(
   images: { image_bytes: string; image_type: string; filename: string }[],
   onEvent: (event: StreamEvent) => void,
   onError: (error: Error) => void,
+  researchMode = false,
 ): { abort: () => void } {
   const controller = new AbortController();
 
@@ -336,6 +383,7 @@ export function streamMessage(
             content,
             files,
             images,
+            research_mode: researchMode,
           }),
           signal: controller.signal,
         },
@@ -354,10 +402,22 @@ export function streamMessage(
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let terminalEventReceived = false;
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          if (buffer.trim()) {
+            const event = parseSseFrame(buffer);
+            if (event) {
+              onEvent(event);
+              terminalEventReceived =
+                event.type === "done" || event.type === "error";
+            }
+          }
+          break;
+        }
 
         buffer += decoder.decode(value, { stream: true });
 
@@ -366,8 +426,16 @@ export function streamMessage(
 
         for (const frame of frames) {
           const event = parseSseFrame(frame);
-          if (event) onEvent(event);
+          if (event) {
+            onEvent(event);
+            if (event.type === "done" || event.type === "error") {
+              terminalEventReceived = true;
+            }
+          }
         }
+      }
+      if (!terminalEventReceived) {
+        onError(new Error("The assistant stream ended before it completed."));
       }
     } catch (err) {
       if (controller.signal.aborted) return; // intentional cancel
@@ -383,6 +451,7 @@ export function streamCodexMessage(
   content: string,
   onEvent: (event: StreamEvent) => void,
   onError: (error: Error) => void,
+  researchMode = false,
 ): { abort: () => void } {
   return streamMessage(
     threadId,
@@ -391,6 +460,7 @@ export function streamCodexMessage(
     [],
     onEvent,
     onError,
+    researchMode,
   );
 }
 
@@ -421,9 +491,12 @@ export async function uploadFiles(
 }
 
 /** POST /voice/transcribe — matches main.py's voice_transcribe(audio: UploadFile). */
-export async function transcribeAudio(audioBlob: Blob): Promise<string> {
+export async function transcribeAudio(
+  audioBlob: Blob,
+  filename: string,
+): Promise<string> {
   const formData = new FormData();
-  formData.append("audio", audioBlob, "recording.webm");
+  formData.append("audio", audioBlob, filename);
 
   const res = await fetch(`${API_BASE_URL}/voice/transcribe`, {
     method: "POST",

@@ -3,11 +3,11 @@
 services:
   - type: web
     name: cat-gpt-api
-    runtime: python
+    runtime: docker
     plan: free
     rootDir: .
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /health
     envVars:
       - key: GROQ_API_KEY
