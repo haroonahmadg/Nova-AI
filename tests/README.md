@@ -6,6 +6,12 @@ The repository uses pytest. Run the suite from the repository root:
 python -m pytest
 ```
 
+For focused document-ingestion coverage, run:
+
+```powershell
+python -m pytest tests/test_rag.py
+```
+
 `conftest.py` assigns temporary storage paths per test and reloads imported
 environment-dependent modules in place so they observe the current test
 configuration without invalidating existing module references. Tests are

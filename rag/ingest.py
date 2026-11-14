@@ -30,6 +30,7 @@ from bs4 import BeautifulSoup
 from filelock import FileLock, Timeout
 
 from rag.paths import DATA_DIR, FAISS_DIR, INDEX_PATH, METADATA_PATH, UPLOAD_DIR
+from rag.metadata import load_metadata_registry
 from utils.security import (
     validate_file_security,
     sanitize_path,
@@ -352,6 +353,31 @@ def load_document(file_path: str) -> List[Document]:
                 f"Could not load Word file: {err}"
             )
 
+    if ext in {".xlsx", ".xls"}:
+        import pandas as pd
+
+        workbooks = pd.read_excel(
+            file_path,
+            sheet_name=None,
+            header=None,
+            dtype=str,
+        )
+        documents = []
+        for page, (sheet_name, frame) in enumerate(workbooks.items(), start=1):
+            content = frame.fillna("").to_csv(index=False, header=False).strip()
+            if content:
+                documents.append(
+                    Document(
+                        page_content=f"Sheet: {sheet_name}\n{content}",
+                        metadata={
+                            "source": filename,
+                            "page": page,
+                            "sheet_name": str(sheet_name),
+                        },
+                    )
+                )
+        return documents
+
     # Plain text / markdown / Python / extensionless files.
     emit_ingest_event(
         f"📖 Reading text file: {filename}",
@@ -456,20 +482,7 @@ def _load_metadata_registry() -> List[Dict[str, Any]]:
     Load stored chunk metadata from disk.
     """
 
-    if not os.path.exists(METADATA_PATH):
-        return []
-
-    try:
-        with open(METADATA_PATH, "rb") as f:
-            data = pickle.load(f)
-
-        if isinstance(data, list):
-            return data
-
-        return []
-
-    except Exception:
-        return []
+    return load_metadata_registry(METADATA_PATH)
 
 
 def _save_metadata_registry(
@@ -484,14 +497,7 @@ def _save_metadata_registry(
         exist_ok=True,
     )
 
-    with open(
-        METADATA_PATH,
-        "wb",
-    ) as f:
-        pickle.dump(
-            metadata_list,
-            f,
-        )
+    _write_pickle_atomically(METADATA_PATH, metadata_list)
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +633,7 @@ def _write_pickle_atomically(path: str, value: Any) -> None:
         with tempfile.NamedTemporaryFile(
             mode="wb",
             dir=directory,
-            prefix=".rag-migration-",
+            prefix=".rag-atomic-",
             suffix=".tmp",
             delete=False,
         ) as temporary_file:
@@ -965,8 +971,12 @@ def ingest_file(file_path: str,user_id: str | None = None) -> int:
 
         documents = []
 
-    # Fallback text reader.
-    if not documents:
+    # Fallback text reader for formats that contain plain text.
+    fallback_extensions = {".txt", ".md", ".py", ".json", ".csv", ""}
+    if (
+        not documents
+        and Path(safe_file_path).suffix.lower() in fallback_extensions
+    ):
 
         try:
 

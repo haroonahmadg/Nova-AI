@@ -8,6 +8,7 @@ import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { streamCodexMessage } from "@/lib/api";
+import { markdownText } from "@/lib/markdown";
 import type { Citation } from "@/lib/types";
 
 type Reminder = {
@@ -36,15 +37,6 @@ const EMPTY_REMINDERS: Reminder[] = [];
 const EMPTY_CONVERSATIONS: CodexConversation[] = [];
 const CODEX_SYSTEM_INSTRUCTION =
   "You are Codex, a coding assistant. Work only with the code and context provided. Do not claim to edit repository files. When showing source code, use fenced Markdown code blocks with the correct language identifier, and keep explanations outside code blocks.";
-
-function markdownText(node: ReactNode): string {
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(markdownText).join("");
-  if (node && typeof node === "object" && "props" in node) {
-    return markdownText((node.props as { children?: ReactNode }).children);
-  }
-  return "";
-}
 
 function CodexCodeBlock({
   language,
@@ -249,7 +241,17 @@ function useAccountStorage<T>(
   return [value, setValue, loaded] as const;
 }
 
-export function CodexView({ userKey, onExit }: { userKey: string; onExit: () => void }) {
+export function CodexView({
+  userKey,
+  onExit,
+  maxPromptChars,
+  limitsError,
+}: {
+  userKey: string;
+  onExit: () => void;
+  maxPromptChars: number | null;
+  limitsError: string | null;
+}) {
   const [request, setRequest] = useState("");
   const [thinkMode, setThinkMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -267,6 +269,10 @@ export function CodexView({ userKey, onExit }: { userKey: string; onExit: () => 
   const activeConversation = conversations.find((conversation) => conversation.id === activeId);
   const entries = activeConversation?.entries ?? [];
   const lastUserEntryId = [...entries].reverse().find((entry) => entry.role === "user")?.id;
+  const codexPromptLimit = Math.max(
+    0,
+    (maxPromptChars ?? 0) - CODEX_SYSTEM_INSTRUCTION.length - 2,
+  );
 
   useEffect(() => {
     // Streaming belongs to the account-scoped workspace and resets when its key changes.
@@ -307,6 +313,16 @@ export function CodexView({ userKey, onExit }: { userKey: string; onExit: () => 
     const prompt = value.trim();
     if (!prompt) {
       setError("Enter a coding task or paste code to get started.");
+      return;
+    }
+    if (maxPromptChars === null) {
+      setError("The server message limit has not loaded yet. Please try again.");
+      return;
+    }
+    if (prompt.length > codexPromptLimit) {
+      setError(
+        `This prompt is too long. Codex allows ${codexPromptLimit} characters after its instructions.`,
+      );
       return;
     }
 
@@ -595,14 +611,24 @@ export function CodexView({ userKey, onExit }: { userKey: string; onExit: () => 
                   event.currentTarget.form?.requestSubmit();
                 }
               }}
-              maxLength={12000}
+              maxLength={codexPromptLimit}
               rows={2}
-              disabled={isStreaming}
+              disabled={isStreaming || maxPromptChars === null}
               className="max-h-32 min-h-14 w-full resize-none bg-transparent px-2 py-1.5 text-sm text-white outline-none placeholder:text-white/40 disabled:opacity-60 sm:max-h-64 sm:min-h-24 sm:py-2"
               placeholder="Ask Codex anything about your code…"
             />
+            {maxPromptChars === null && (
+              <p role={limitsError ? "alert" : "status"} className="px-2 pt-2 text-sm text-white/55">
+                {limitsError
+                  ? `Codex is unavailable because the server message limit could not be loaded: ${limitsError}`
+                  : "Loading the server message limit…"}
+              </p>
+            )}
             {error && <p role="alert" className="px-2 pt-2 text-sm text-red-400">{error}</p>}
             <div className="mt-2 flex items-center justify-between border-t border-surface-border px-1 pt-3">
+              <span className="text-xs text-white/40">
+                {request.length}/{codexPromptLimit}
+              </span>
               <button
                 type="button"
                 onClick={() => setThinkMode((enabled) => !enabled)}

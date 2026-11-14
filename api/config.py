@@ -10,12 +10,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from utils.file_types import ALLOWED_FILE_EXTENSIONS, ALLOWED_IMAGE_EXTENSIONS
 from utils.limits import (
     MAX_FILE_MB,
     MAX_IMAGE_MB,
     MAX_IMAGES_PER_REQUEST,
     MAX_PROMPT_CHARS,
     MAX_UPLOAD_FILES,
+    MAX_USER_STORAGE_MB,
     _positive_int,
 )
 
@@ -34,26 +36,6 @@ UPLOAD_DIR = Path(
     os.getenv("UPLOAD_DIR", str(DATA_DIR / "upload"))
 )
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-ALLOWED_IMAGE_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".gif",
-}
-
-ALLOWED_FILE_EXTENSIONS = {
-    ".pdf",
-    ".doc",
-    ".docx",
-    ".txt",
-    ".md",
-    ".csv",
-    ".json",
-    ".xlsx",
-    ".xls",
-}
 
 # Comma-separated list of allowed frontend origins for CORS, e.g.
 # "http://localhost:3000,http://localhost:3001,https://myapp.example.com"
@@ -83,6 +65,7 @@ GENERATED_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()
+RATE_LIMIT_REDIS_URL = os.getenv("REDIS_URL", "").strip()
 SESSION_TTL_SECONDS = _positive_int(
     "SESSION_TTL_SECONDS",
     str(7 * 24 * 60 * 60),

@@ -8,8 +8,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from utils.numeric_runtime import configure_numeric_thread_limits
+
+configure_numeric_thread_limits()
+
 import streamlit as st
 from dotenv import load_dotenv
+from filelock import Timeout as FileLockTimeout
 
 from agent.graph import (
     CHECKPOINT_DB_PATH,
@@ -30,6 +35,15 @@ from utils.limits import (
     MAX_IMAGES_PER_REQUEST,
     MAX_PROMPT_CHARS,
     MAX_UPLOAD_FILES,
+    MAX_USER_STORAGE_MB,
+)
+from utils.file_types import ALLOWED_FILE_EXTENSIONS, ALLOWED_IMAGE_EXTENSIONS
+from utils.storage import (
+    UserStorageLimitExceeded,
+    legacy_flat_upload_roots,
+    reserve_user_storage,
+    safe_storage_component,
+    user_upload_dir,
 )
 
 
@@ -70,32 +84,12 @@ UPLOAD_DIR.mkdir(
     parents=True,
     exist_ok=True,
 )
+MAX_USER_STORAGE_BYTES = MAX_USER_STORAGE_MB * 1024 * 1024
 
 # gTTS gets noticeably slower and more failure-prone on very long text, and
 # a multi-minute audio clip is not useful for a "listen to this reply"
 # button anyway. Text beyond this length is truncated before synthesis.
 MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "1500"))
-
-ALLOWED_IMAGE_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".gif",
-}
-
-ALLOWED_FILE_EXTENSIONS = {
-    ".pdf",
-    ".doc",
-    ".docx",
-    ".txt",
-    ".md",
-    ".csv",
-    ".json",
-    ".xlsx",
-    ".xls",
-}
-
 
 # ============================================================
 # PAGE CONFIG
@@ -1010,14 +1004,9 @@ def save_uploaded_file(
     if it needs to process the uploaded document.
     """
 
-    thread_dir = (
-        UPLOAD_DIR / thread_id
-    )
-
-    thread_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    user_id = "local"
+    local_upload_dir = user_upload_dir(UPLOAD_DIR, user_id)
+    thread_dir = UPLOAD_DIR / safe_storage_component(thread_id)
 
     safe_name = (
         Path(
@@ -1037,9 +1026,24 @@ def save_uploaded_file(
         thread_dir / filename
     )
 
-    path.write_bytes(
-        uploaded_file.getvalue()
-    )
+    file_bytes = uploaded_file.getvalue()
+    with reserve_user_storage(
+        user_id,
+        upload_dir=UPLOAD_DIR,
+        generated_image_dir=DATA_DIR / "generated_images",
+        lock_dir=DATA_DIR / ".storage-locks",
+        max_bytes=MAX_USER_STORAGE_BYTES,
+        requested_bytes=len(file_bytes),
+        additional_roots=lambda: legacy_flat_upload_roots(
+            UPLOAD_DIR,
+            excluded=local_upload_dir,
+        ),
+    ):
+        thread_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        path.write_bytes(file_bytes)
 
     return path
 
@@ -1935,6 +1939,14 @@ def process_user_message(
                     uploaded_file,
                     st.session_state.thread_id,
                 )
+            except UserStorageLimitExceeded as exc:
+                st.error(str(exc))
+                return
+            except FileLockTimeout:
+                st.error(
+                    "Account storage is busy. Please try uploading the file again."
+                )
+                return
             except OSError as exc:
                 st.error(
                     f"Could not save '{uploaded_file.name}': {exc}"

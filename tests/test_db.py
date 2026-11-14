@@ -9,6 +9,8 @@ from database.db import (
     save_memory,
     get_memories,
     delete_thread,
+    update_thread_title,
+    search_threads,
 )
 
 
@@ -85,6 +87,32 @@ def test_save_and_get_messages():
     assert messages[1]["content"] == "Hello! How can I help?"
 
 
+def test_thread_helpers_use_configured_database():
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO threads (thread_id, title) VALUES (?, ?)",
+            ("thread-for-search", "Original title"),
+        )
+        conn.execute(
+            "INSERT INTO messages (thread_id, role, content) VALUES (?, ?, ?)",
+            ("thread-for-search", "user", "Searchable message text"),
+        )
+        conn.commit()
+
+    update_thread_title("thread-for-search", "Updated title")
+
+    with get_connection() as conn:
+        title = conn.execute(
+            "SELECT title FROM threads WHERE thread_id = ?",
+            ("thread-for-search",),
+        ).fetchone()["title"]
+
+    assert title == "Updated title"
+    assert search_threads("Searchable") == [
+        ("thread-for-search", "Updated title")
+    ]
+
+
 def test_save_and_get_memories():
     save_memory("user_name", "Alex")
     save_memory("favorite_language", "Python")
@@ -147,6 +175,63 @@ def test_initialize_migrates_legacy_memories_table(has_user_id_column):
 
     assert primary_key == ["key", "user_id"]
     assert tuple(legacy_memory) == ("kept", None)
+
+
+def test_initialize_creates_user_scoped_events_table():
+    with get_connection() as conn:
+        columns = {
+            row["name"]: row
+            for row in conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        indexes = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(events)").fetchall()
+        }
+
+    required_columns = {
+        "id",
+        "user_id",
+        "title",
+        "event_date",
+        "event_time",
+        "description",
+    }
+    assert required_columns <= set(columns)
+    assert columns["user_id"]["notnull"] == 1
+    assert "idx_events_user_date" in indexes
+
+
+def test_initialize_migrates_legacy_events_without_assigning_an_owner():
+    with get_connection() as conn:
+        conn.execute("DROP TABLE events")
+        conn.execute(
+            """
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                event_time TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO events (title, event_date, event_time, description)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("Legacy event", "2026-11-14", "", "Unassigned"),
+        )
+        conn.commit()
+
+    init_db()
+
+    with get_connection() as conn:
+        event = conn.execute(
+            "SELECT title, user_id FROM events WHERE id = 1"
+        ).fetchone()
+
+    assert tuple(event) == ("Legacy event", None)
 
 
 def test_delete_thread_cascades():

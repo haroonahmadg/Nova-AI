@@ -1,7 +1,12 @@
 import importlib
+import os
 import sys
 
 import pytest
+
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.pop("REDIS_URL", None)
 
 _ENVIRONMENT_MODULES = (
     "utils.limits",
@@ -34,6 +39,7 @@ def reset_test_state(monkeypatch, tmp_path_factory):
         "SESSION_SECRET",
         "test-only-session-secret-that-is-long-enough-123456",
     )
+    monkeypatch.delenv("REDIS_URL", raising=False)
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
     monkeypatch.setenv("CHECKPOINT_DB_PATH", str(test_dir / "checkpoints.sqlite"))
 

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import type { AuthUser, LoginResponseDTO, MeResponseDTO } from "@/lib/types";
+import { formatApiErrorResponse } from "@/lib/apiErrors";
 
 const TOKEN_STORAGE_KEY = "ai_assistant_session_token";
 const API_BASE_URL =
@@ -141,7 +142,7 @@ export function useAuth() {
       const data = (await readJson<LoginResponseDTO>(res)) as LoginResponseDTO;
 
       if (!res.ok) {
-        setLoginError(data?.detail ?? "Sign-in failed.");
+        setLoginError(formatApiErrorResponse(data, "Sign-in failed."));
         return;
       }
 
@@ -176,7 +177,7 @@ export function useAuth() {
       const data = (await readJson<LoginResponseDTO>(res)) as LoginResponseDTO;
 
       if (!res.ok) {
-        setLoginError(data?.detail ?? "Login failed.");
+        setLoginError(formatApiErrorResponse(data, "Login failed."));
         return;
       }
 
@@ -211,7 +212,7 @@ export function useAuth() {
       const data = (await readJson<LoginResponseDTO>(res)) as LoginResponseDTO;
 
       if (!res.ok) {
-        setLoginError(data?.detail ?? "Sign-up failed.");
+        setLoginError(formatApiErrorResponse(data, "Sign-up failed."));
         return;
       }
 
@@ -249,13 +250,13 @@ export function useAuth() {
         body: JSON.stringify({ new_password: newPassword, current_password: currentPassword ?? null }),
       });
 
-      const data = (await readJson<{ detail?: string; password_set?: boolean }>(res)) as {
-        detail?: string;
+      const data = (await readJson<{ detail?: unknown; password_set?: boolean }>(res)) as {
+        detail?: unknown;
         password_set?: boolean;
       };
 
       if (!res.ok) {
-        setLoginError(data?.detail ?? "Unable to update password.");
+        setLoginError(formatApiErrorResponse(data, "Unable to update password."));
         return false;
       }
 

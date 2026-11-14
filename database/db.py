@@ -73,6 +73,17 @@ _MEMORIES_CREATE_SQL = """
     )
 """
 
+_EVENTS_CREATE_SQL = """
+    CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        event_date TEXT NOT NULL,
+        event_time TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT ''
+    )
+"""
+
 
 def _ensure_memories_table(connection: SQLiteConnection) -> None:
     """Create or migrate the memories table while preserving existing rows."""
@@ -141,6 +152,45 @@ def _ensure_memories_table(connection: SQLiteConnection) -> None:
         raise
 
 
+def _ensure_events_table(connection: SQLiteConnection) -> None:
+    """Create user-scoped calendar storage and quarantine unowned legacy rows."""
+
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+
+    try:
+        info = connection.execute("PRAGMA table_info(events)").fetchall()
+        if not info:
+            connection.execute(_EVENTS_CREATE_SQL)
+        else:
+            columns = {row[1] for row in info}
+            required_columns = {
+                "id",
+                "title",
+                "event_date",
+                "event_time",
+                "description",
+            }
+            if not required_columns.issubset(columns):
+                raise RuntimeError(
+                    "The events table is missing required calendar columns."
+                )
+            if "user_id" not in columns:
+                # Existing rows have no reliable owner. Keep them intact but
+                # inaccessible to signed-in users rather than exposing them.
+                connection.execute("ALTER TABLE events ADD COLUMN user_id TEXT")
+
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_user_date "
+            "ON events (user_id, event_date, event_time)"
+        )
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def initialize_database() -> None:
     """Sets up database tables with indexes for fast searching."""
     try:
@@ -170,6 +220,7 @@ def initialize_database() -> None:
             """)
             
             _ensure_memories_table(conn)
+            _ensure_events_table(conn)
             
             # Index for fast lookup of chat messages by thread
             cursor.execute("""
@@ -221,7 +272,7 @@ def save_thread(thread_id: str, title: str) -> bool:
                     title = excluded.title,
                     updated_at = excluded.updated_at
                 """,
-                (clean_id, clean_title, datetime.now())
+                (clean_id, clean_title, datetime.now().isoformat(sep=" "))
             )
             conn.commit()
             return True
@@ -299,7 +350,7 @@ def save_message(thread_id: str, role: str, content: str) -> bool:
             # Update thread timestamp
             cursor.execute(
                 "UPDATE threads SET updated_at = ? WHERE thread_id = ?",
-                (datetime.now(), clean_id)
+                (datetime.now().isoformat(sep=" "), clean_id)
             )
             conn.commit()
             return True
@@ -356,7 +407,12 @@ def save_memory(key: str, value: str, user_id: Optional[str] = None) -> bool:
                     value = excluded.value,
                     updated_at = excluded.updated_at
                 """,
-                (clean_key, clean_val, clean_user_id, datetime.now())
+                (
+                    clean_key,
+                    clean_val,
+                    clean_user_id,
+                    datetime.now().isoformat(sep=" "),
+                )
             )
             conn.commit()
             return True
@@ -414,23 +470,19 @@ def delete_memory(key: str, user_id: str) -> bool:
 
 def update_thread_title(thread_id: str, new_title: str):
     """Update the title of a specific chat thread in the database."""
-    conn = sqlite3.connect("chat_history.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE threads SET title = ? WHERE thread_id = ?",
-        (new_title, thread_id)
-    )
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE threads SET title = ? WHERE thread_id = ?",
+            (new_title, thread_id),
+        )
+        conn.commit()
 
 def search_threads(query: str):
     """Search threads by matching title or message content."""
-    conn = sqlite3.connect("chat_history.db")
-    cursor = conn.cursor()
     search_pattern = f"%{query.strip()}%"
-    
-    try:
-        cursor.execute(
+
+    with get_connection() as conn:
+        rows = conn.execute(
             """
             SELECT DISTINCT t.thread_id, t.title
             FROM threads t
@@ -438,12 +490,7 @@ def search_threads(query: str):
             WHERE t.title LIKE ? OR m.content LIKE ?
             ORDER BY t.created_at DESC
             """,
-            (search_pattern, search_pattern)
-        )
-        results = cursor.fetchall()
-    except Exception as e:
-        results = []
-    finally:
-        conn.close()
-        
-    return results
+            (search_pattern, search_pattern),
+        ).fetchall()
+
+    return [tuple(row) for row in rows]

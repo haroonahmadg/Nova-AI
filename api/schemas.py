@@ -2,6 +2,13 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from api.config import (
+    EMAIL_MAX_LENGTH,
+    NAME_MAX_LENGTH,
+    PASSWORD_MAX_LENGTH,
+)
+from utils.limits import MAX_UPLOAD_FILES
+
 
 class CreateThreadResponse(BaseModel):
     thread_id: str
@@ -17,24 +24,27 @@ class ArchiveResponse(BaseModel):
     archived: bool
 
 class GoogleLoginRequest(BaseModel):
-    credential: str
+    credential: str = Field(min_length=1, max_length=16_384)
 
 
 class RegisterRequest(BaseModel):
-    email: str
-    password: str
-    name: str | None = None
+    email: str = Field(max_length=EMAIL_MAX_LENGTH)
+    password: str = Field(max_length=PASSWORD_MAX_LENGTH)
+    name: str | None = Field(default=None, max_length=NAME_MAX_LENGTH)
 
 
 class PasswordLoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=EMAIL_MAX_LENGTH)
+    password: str = Field(max_length=PASSWORD_MAX_LENGTH)
 
 
 class SetPasswordRequest(BaseModel):
-    new_password: str
+    new_password: str = Field(max_length=PASSWORD_MAX_LENGTH)
     # Required only when the account already has a password.
-    current_password: str | None = None
+    current_password: str | None = Field(
+        default=None,
+        max_length=PASSWORD_MAX_LENGTH,
+    )
 
 
 class SetPasswordResponse(BaseModel):
@@ -64,6 +74,8 @@ class RenameThreadRequest(BaseModel):
 class MessageOut(BaseModel):
     role: str
     content: str
+    image_url: str | None = None
+    research_mode: bool | None = None
 
 
 class ImagePayload(BaseModel):
@@ -92,7 +104,10 @@ class FilePayload(BaseModel):
 class SendMessageRequest(BaseModel):
     content: str = ""
     images: list[ImagePayload] = Field(default_factory=list)
-    files: list[FilePayload] = Field(default_factory=list)
+    files: list[FilePayload] = Field(
+        default_factory=list,
+        max_length=MAX_UPLOAD_FILES,
+    )
     research_mode: bool = False
 
 

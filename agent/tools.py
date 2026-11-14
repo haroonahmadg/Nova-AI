@@ -16,7 +16,6 @@ from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-import requests
 from dotenv import load_dotenv
 
 from langchain_core.tools import tool
@@ -37,6 +36,9 @@ from database.db import (
 # =========================================================
 
 load_dotenv()
+
+import api.config as api_config
+from utils.storage import UserStorageLimitExceeded, reserve_user_storage
 
 
 # =========================================================
@@ -159,8 +161,6 @@ import hashlib
 
 logger = logging.getLogger(__name__)
 
-GEMINI_IMAGE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
-GEMINI_IMAGE_MODEL = "gemini-nano-banana-2.1"
 CLOUDFLARE_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 CLOUDFLARE_IMAGE_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 IMAGE_TIMEOUT_SECONDS = 60
@@ -169,6 +169,7 @@ GENERATED_IMAGE_DIR = Path(
     os.getenv("DATA_DIR", str(Path(__file__).resolve().parent.parent / "data"))
 ) / "generated_images"
 GENERATED_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+MAX_USER_STORAGE_BYTES = api_config.MAX_USER_STORAGE_MB * 1024 * 1024
 
 MAX_IMAGE_PROMPT_LENGTH = 500
 
@@ -189,6 +190,27 @@ def get_generated_image_dir(user_id: str, *, create: bool = False) -> Path:
     if create:
         account_dir.mkdir(parents=True, exist_ok=True)
     return account_dir
+
+
+def _save_user_generated_image(image, user_id: str, filename: str) -> Path:
+    from io import BytesIO
+
+    image_buffer = BytesIO()
+    image.convert("RGB").save(image_buffer, format="PNG")
+    image_bytes = image_buffer.getvalue()
+    saved_path = get_generated_image_dir(user_id, create=True) / filename
+
+    with reserve_user_storage(
+        user_id,
+        upload_dir=api_config.UPLOAD_DIR,
+        generated_image_dir=GENERATED_IMAGE_DIR,
+        lock_dir=api_config.DATA_DIR / ".storage-locks",
+        max_bytes=MAX_USER_STORAGE_BYTES,
+        requested_bytes=len(image_bytes),
+    ):
+        saved_path.write_bytes(image_bytes)
+
+    return saved_path
 
 
 # =========================================================
@@ -1095,9 +1117,9 @@ def _describe_image_error(exc: Exception) -> str:
         return "image service is busy or not configured right now, please try again"
     if status:
         return f"image service returned status {status}."
-    if isinstance(exc, (requests.exceptions.Timeout, httpx.TimeoutException)):
+    if isinstance(exc, httpx.TimeoutException):
         return "image service timed out, please try again"
-    if isinstance(exc, (requests.exceptions.ConnectionError, httpx.RequestError)):
+    if isinstance(exc, httpx.RequestError):
         return "image service could not be reached, please try again"
     return f"{type(exc).__name__}: {exc}"
 
@@ -1112,35 +1134,6 @@ def _decode_generated_image(encoded: object) -> bytes:
     if not image_bytes:
         raise ValueError("the image provider returned an empty image.")
     return image_bytes
-
-
-def _generate_gemini_image(prompt: str, api_key: str) -> bytes:
-    response = httpx.post(
-        GEMINI_IMAGE_URL,
-        headers={
-            "x-goog-api-key": api_key,
-            "Api-Revision": "2026-05-20",
-        },
-        json={
-            "model": GEMINI_IMAGE_MODEL,
-            "input": [{"type": "text", "text": prompt}],
-        },
-        timeout=IMAGE_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    payload = response.json()
-
-    image = payload.get("output_image")
-    if isinstance(image, dict) and image.get("data"):
-        return _decode_generated_image(image["data"])
-
-    outputs = payload.get("output")
-    if isinstance(outputs, list):
-        for item in outputs:
-            if isinstance(item, dict) and item.get("type") == "image":
-                return _decode_generated_image(item.get("data"))
-
-    raise ValueError("Gemini did not return a generated image.")
 
 
 def _generate_cloudflare_image(
@@ -1173,30 +1166,6 @@ def _generate_cloudflare_image(
     if payload.get("success") is False or not isinstance(result, dict):
         raise ValueError("Cloudflare did not return a generated image.")
     return _decode_generated_image(result.get("image"))
-
-
-def _should_fallback_image_provider(exc: Exception) -> bool:
-    if isinstance(exc, (requests.exceptions.RequestException, httpx.RequestError)):
-        return True
-    response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
-    if status in {401, 403, 408, 425, 429} or (
-        isinstance(status, int) and status >= 500
-    ):
-        return True
-    if status == 400:
-        try:
-            error = response.json().get("error", {})
-        except (AttributeError, ValueError):
-            return False
-        if not isinstance(error, dict):
-            return False
-        error_status = str(error.get("status", "")).upper()
-        message = str(error.get("message", "")).casefold()
-        return error_status in {"API_KEY_INVALID", "UNAUTHENTICATED"} or (
-            "api key" in message and ("invalid" in message or "not valid" in message)
-        )
-    return False
 
 
 # =========================================================
@@ -1235,10 +1204,6 @@ def generate_image(
     if not user_id:
         return "Image generation error: an authenticated user is required."
 
-    gemini_api_key = (
-        os.getenv("Gemini_API_Key", "").strip()
-        or os.getenv("GEMINI_API_KEY", "").strip()
-    )
     cloudflare_api_token = (
         os.getenv("Cloudflare_key", "").strip()
         or os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
@@ -1246,65 +1211,35 @@ def generate_image(
     cloudflare_account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
     saved_path = None
 
-    emit_tool_event(
-        "Generating image with Gemini",
-        event="tool_started",
-        tool="generate_image",
-    )
-
     try:
-        if gemini_api_key:
-            try:
-                image_bytes = _generate_gemini_image(prompt, gemini_api_key)
-            except Exception as gemini_error:
-                if not _should_fallback_image_provider(gemini_error):
-                    raise
-                if not cloudflare_api_token:
-                    raise
-                if not cloudflare_account_id:
-                    raise RuntimeError(
-                        "Gemini image generation failed and Cloudflare fallback "
-                        "requires CLOUDFLARE_ACCOUNT_ID."
-                    ) from gemini_error
-                logger.warning(
-                    "Gemini image request failed; trying Cloudflare Workers AI (error=%s).",
-                    type(gemini_error).__name__,
-                )
-                emit_tool_event(
-                    "Trying Cloudflare image generation fallback",
-                    event="tool_started",
-                    tool="generate_image",
-                )
-                image_bytes = _generate_cloudflare_image(
-                    prompt,
-                    cloudflare_api_token,
-                    cloudflare_account_id,
-                )
-        elif cloudflare_api_token:
-            if not cloudflare_account_id:
-                raise RuntimeError(
-                    "Cloudflare image generation requires CLOUDFLARE_ACCOUNT_ID."
-                )
-            logger.info("Gemini_API_Key is not configured; using Cloudflare Workers AI.")
-            image_bytes = _generate_cloudflare_image(
-                prompt,
-                cloudflare_api_token,
-                cloudflare_account_id,
-            )
-        else:
+        if not cloudflare_api_token:
             raise RuntimeError(
-                "Image generation is not configured. Set Gemini_API_Key or "
-                "configure Cloudflare Workers AI."
+                "Image generation is not configured. Set Cloudflare_key and "
+                "CLOUDFLARE_ACCOUNT_ID for Cloudflare Workers AI."
             )
+        if not cloudflare_account_id:
+            raise RuntimeError(
+                "Cloudflare image generation requires CLOUDFLARE_ACCOUNT_ID."
+            )
+
+        emit_tool_event(
+            "Generating image with Cloudflare Workers AI",
+            event="tool_started",
+            tool="generate_image",
+        )
+        image_bytes = _generate_cloudflare_image(
+            prompt,
+            cloudflare_api_token,
+            cloudflare_account_id,
+        )
 
         filename = f"{uuid.uuid4().hex[:16]}.png"
-        saved_path = get_generated_image_dir(user_id, create=True) / filename
 
         from PIL import Image
         from io import BytesIO
 
         with Image.open(BytesIO(image_bytes)) as image:
-            image.convert("RGB").save(saved_path, format="PNG")
+            saved_path = _save_user_generated_image(image, user_id, filename)
 
         if saved_path.stat().st_size == 0:
             raise ValueError("the image provider returned an empty image.")
@@ -1318,7 +1253,11 @@ def generate_image(
 
     except Exception as exc:
         logger.warning("Image generation failed with %s", type(exc).__name__)
-        error_message = _describe_image_error(exc)
+        error_message = (
+            str(exc)
+            if isinstance(exc, UserStorageLimitExceeded)
+            else _describe_image_error(exc)
+        )
 
     if saved_path is not None:
         try:
@@ -1338,6 +1277,11 @@ def generate_image(
 # =========================================================
 # CREATE EVENT TOOL
 # =========================================================
+
+def _calendar_user_id() -> str | None:
+    user_id = active_user_id.get()
+    return user_id.strip() if isinstance(user_id, str) and user_id.strip() else None
+
 
 @tool
 def create_event(
@@ -1443,6 +1387,10 @@ def create_event(
                 "time must use HH:MM format."
             )
 
+    user_id = _calendar_user_id()
+    if user_id is None:
+        return "Calendar error: no active user session was found."
+
     emit_tool_event(
         "Creating calendar event",
         event="tool_started",
@@ -1460,10 +1408,11 @@ def create_event(
         cursor.execute(
             """
             INSERT INTO events
-            (title, event_date, event_time, description)
-            VALUES (?, ?, ?, ?)
+            (user_id, title, event_date, event_time, description)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
+                user_id,
                 title.strip(),
                 event_date.strip(),
                 event_time.strip(),
@@ -1521,6 +1470,10 @@ def list_events() -> str:
     List all calendar events.
     """
 
+    user_id = _calendar_user_id()
+    if user_id is None:
+        return "Calendar error: no active user session was found."
+
     emit_tool_event(
         "Loading calendar events",
         event="tool_started",
@@ -1544,8 +1497,10 @@ def list_events() -> str:
                 event_time,
                 description
             FROM events
+            WHERE user_id = ?
             ORDER BY event_date, event_time
-            """
+            """,
+            (user_id,),
         )
 
         events = cursor.fetchall()
@@ -1643,6 +1598,10 @@ def delete_event(
             "event ID must be an integer."
         )
 
+    user_id = _calendar_user_id()
+    if user_id is None:
+        return "Calendar error: no active user session was found."
+
     emit_tool_event(
         "Deleting calendar event",
         event="tool_started",
@@ -1658,8 +1617,8 @@ def delete_event(
         cursor = connection.cursor()
 
         cursor.execute(
-            "DELETE FROM events WHERE id = ?",
-            (event_id,),
+            "DELETE FROM events WHERE id = ? AND user_id = ?",
+            (event_id, user_id),
         )
 
         if cursor.rowcount == 0:
@@ -2274,14 +2233,13 @@ def generate_qr_code(text: str) -> str:
             raise ValueError("QR-code service returned an empty image.")
 
         filename = f"{uuid.uuid4().hex[:16]}.png"
-        saved_path = get_generated_image_dir(user_id, create=True) / filename
         from io import BytesIO
         from PIL import Image
 
         with Image.open(BytesIO(response.content)) as image:
             if image.format != "PNG":
                 raise ValueError("the returned image is not a valid PNG.")
-            image.convert("RGB").save(saved_path, format="PNG")
+            saved_path = _save_user_generated_image(image, user_id, filename)
         if saved_path.stat().st_size == 0:
             raise ValueError("the saved QR image is empty.")
         emit_tool_event("QR code generated", event="tool_completed", tool="generate_qr_code")
@@ -2290,6 +2248,8 @@ def generate_qr_code(text: str) -> str:
         error_message = "The QR-code request timed out. Please try again."
     except httpx.RequestError as exc:
         error_message = f"The QR-code request failed ({type(exc).__name__})."
+    except UserStorageLimitExceeded as exc:
+        error_message = str(exc)
     except ValueError as exc:
         error_message = str(exc)
     except Exception as exc:

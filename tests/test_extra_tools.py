@@ -284,6 +284,49 @@ def test_generate_password_guarantees_classes_and_validates_length():
     assert "between 8 and 64" in agent_tools.generate_password.invoke({"length": 7})
 
 
+def test_calendar_events_are_created_and_isolated_by_user():
+    from database.db import initialize_database
+
+    initialize_database()
+    assert "no active user session" in agent_tools.create_event.invoke({
+        "title": "Unscoped event",
+        "event_date": "2026-11-14",
+    })
+    assert "no active user session" in agent_tools.list_events.invoke({})
+
+    first_user = agent_tools.active_user_id.set("calendar-user-1")
+    try:
+        created = agent_tools.create_event.invoke({
+            "title": "Private event",
+            "event_date": "2026-11-14",
+            "event_time": "17:30",
+            "description": "First user's event",
+        })
+    finally:
+        agent_tools.active_user_id.reset(first_user)
+
+    assert "Event created successfully." in created
+    event_id = int(created.split("Event ID: ", 1)[1].splitlines()[0])
+
+    second_user = agent_tools.active_user_id.set("calendar-user-2")
+    try:
+        assert agent_tools.list_events.invoke({}) == "No calendar events found."
+        assert "No event found" in agent_tools.delete_event.invoke(
+            {"event_id": event_id}
+        )
+    finally:
+        agent_tools.active_user_id.reset(second_user)
+
+    first_user = agent_tools.active_user_id.set("calendar-user-1")
+    try:
+        events = agent_tools.list_events.invoke({})
+    finally:
+        agent_tools.active_user_id.reset(first_user)
+
+    assert "Private event" in events
+    assert "First user's event" in events
+
+
 def test_define_word_success_and_unknown_word(monkeypatch):
     monkeypatch.setattr(
         agent_tools.httpx,

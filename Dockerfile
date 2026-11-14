@@ -3,6 +3,8 @@ FROM python:3.14-slim
 
 WORKDIR /app
 
+ENV OPENBLAS_NUM_THREADS=1
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*

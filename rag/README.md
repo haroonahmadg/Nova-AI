@@ -4,6 +4,9 @@ This package ingests documents and URLs, splits and embeds content, stores
 vectors in a FAISS index, and retrieves user-scoped context for agent
 responses.
 
+- File uploads support PDF, Word, text/Markdown, CSV, JSON, Excel (`.xls`,
+  `.xlsx`), images, and Python source where applicable. Excel ingestion reads
+  each worksheet into searchable text.
 - `ingest.py` handles document loading, chunking, index updates, metadata,
   source listing, and deletion.
 - `search.py` provides similarity search and document-preview retrieval.

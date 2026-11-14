@@ -27,9 +27,22 @@ can validate against server configuration; request validation on the API
 remains authoritative. Chat SSE streams assistant text incrementally and can
 include generic activity, research-plan, image, citation, done, and error
 events. Tool-specific activity labels and IDs are not sent to the client.
+The configured `MAX_UPLOAD_FILES` limit applies both to multipart uploads and
+to file references attached to a chat request.
+`MAX_USER_STORAGE_MB` caps the combined persisted uploaded files and generated
+images for each account (default: 1024 MB). Quota checks are serialized per
+account using a lock file under `DATA_DIR`; deployments sharing media storage
+across workers should share that directory as well.
 Citation items distinguish uploaded documents (`file`, `page`, `preview`) from
 web results (`type`, `title`, `url`); only actual, validated search-result
-URLs should be emitted.
+URLs should be emitted. Message history may include an `image_url` for an
+authenticated, user-scoped generated image, and a `research_mode` flag on the
+latest user turn for retry behavior; uploaded image bytes are never included
+in history responses.
+Set `REDIS_URL` to a shared Redis instance when running multiple workers or
+servers; without it, authentication attempt limits are process-local. Behind
+a reverse proxy, configure Uvicorn's proxy headers and trusted proxy IPs so
+per-IP limits use the client address rather than the proxy address.
 
 Configuration values and local startup steps are in the repository
 [README](../README.md) and [`.env.example`](../.env.example).

@@ -17,10 +17,12 @@ import {
   GeneratedImageDTO,
   LibraryMediaDTO,
 } from "./types";
+import { formatApiErrorResponse } from "./apiErrors";
 import { getStoredToken } from "./useAuth";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const PUBLIC_LIMIT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 8_000];
 
 /**
  * Fired whenever any request comes back 401 (expired/invalid session),
@@ -45,8 +47,8 @@ async function handleJsonResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let message = `Request failed (${res.status})`;
     try {
-      const body = await res.json();
-      message = body?.detail ?? body?.message ?? message;
+      const body: unknown = await res.json();
+      message = formatApiErrorResponse(body, message);
     } catch {
       // body wasn't JSON — keep the generic message
     }
@@ -67,15 +69,60 @@ function toThreadSummary(dto: ThreadSummaryDTO): ThreadSummary {
 export async function getPublicLimits(
   signal?: AbortSignal,
 ): Promise<PublicLimitsDTO> {
-  const res = await fetch(`${API_BASE_URL}/config/limits`, { signal });
-  const limits = await handleJsonResponse<PublicLimitsDTO>(res);
-  if (
-    !Number.isSafeInteger(limits.max_prompt_chars) ||
-    limits.max_prompt_chars <= 0
-  ) {
-    throw new Error("The server returned an invalid message limit.");
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const res = await fetch(`${API_BASE_URL}/config/limits`, { signal });
+      const limits = await handleJsonResponse<PublicLimitsDTO>(res);
+      if (
+        !Number.isSafeInteger(limits.max_prompt_chars) ||
+        limits.max_prompt_chars <= 0
+      ) {
+        throw new Error("The server returned an invalid message limit.");
+      }
+      return limits;
+    } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
+
+      const delay = PUBLIC_LIMIT_RETRY_DELAYS_MS[attempt];
+      const shouldRetry =
+        typeof delay === "number" &&
+        (error instanceof TypeError ||
+          (error instanceof ApiError &&
+            typeof error.status === "number" &&
+            error.status >= 500));
+      if (!shouldRetry) {
+        throw error;
+      }
+
+      await waitForRetry(delay, signal);
+    }
   }
-  return limits;
+}
+
+function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("The request was aborted.", "AbortError"));
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, delayMs);
+    const abort = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      reject(new DOMException("The request was aborted.", "AbortError"));
+    };
+
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) {
+      abort();
+    }
+  });
 }
 
 function toChatMessage(dto: MessageOutDTO, index: number): ChatMessage {
@@ -99,6 +146,10 @@ function toChatMessage(dto: MessageOutDTO, index: number): ChatMessage {
     id: `${role}-${index}`,
     role,
     content: dto.content,
+    ...(typeof dto.image_url === "string" ? { imageUrl: dto.image_url } : {}),
+    ...(role === "user" && typeof dto.research_mode === "boolean"
+      ? { researchMode: dto.research_mode }
+      : {}),
     ...(citations.length ? { citations } : {}),
   };
 }
@@ -160,8 +211,8 @@ export async function fetchGeneratedImage(
     if (res.status === 401) onUnauthorized?.();
     let message = `Could not load image (${res.status})`;
     try {
-      const body = await res.json();
-      message = body?.detail ?? message;
+      const body: unknown = await res.json();
+      message = formatApiErrorResponse(body, message);
     } catch {
       // Keep the status-based message when the server response isn't JSON.
     }
@@ -520,8 +571,8 @@ export async function speakText(text: string, signal?: AbortSignal): Promise<Blo
   if (!res.ok) {
     let message = `Could not generate audio (${res.status})`;
     try {
-      const body = await res.json();
-      message = body?.detail ?? message;
+      const body: unknown = await res.json();
+      message = formatApiErrorResponse(body, message);
     } catch {
       // not JSON — keep generic message
     }
@@ -547,8 +598,8 @@ export async function fetchThreadExportMarkdown(threadId: string): Promise<strin
   if (!res.ok) {
     let message = `Could not export this chat (${res.status})`;
     try {
-      const body = await res.json();
-      message = body?.detail ?? message;
+      const body: unknown = await res.json();
+      message = formatApiErrorResponse(body, message);
     } catch {
       // not JSON — keep generic message
     }

@@ -1,9 +1,13 @@
 import os
-import pickle
+
+from utils.numeric_runtime import configure_numeric_thread_limits
+
+configure_numeric_thread_limits()
 
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 
+from rag.metadata import load_metadata_registry
 from rag.paths import FAISS_DIR, METADATA_PATH
 
 
@@ -167,14 +171,7 @@ def get_document_preview(
             "No document metadata found. Ingest a file before requesting a preview."
         )
 
-    try:
-        with open(METADATA_PATH, "rb") as f:
-            registry = pickle.load(f)
-    except Exception as exc:
-        raise ValueError(f"Could not read document metadata: {exc}") from exc
-
-    if not isinstance(registry, list):
-        return []
+    registry = load_metadata_registry(METADATA_PATH)
 
     allowed = set(source_filter)
 

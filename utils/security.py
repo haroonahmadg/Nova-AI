@@ -1,14 +1,10 @@
 import os
 from pathlib import Path
 
+from utils.file_types import INGEST_FILE_EXTENSIONS
 from utils.limits import MAX_FILE_MB
 
-# Updated whitelist including JPG, JPEG, and PNG image formats
-ALLOWED_EXTENSIONS = {
-    ".pdf", ".csv", ".docx", ".doc", ".txt", ".md", ".json", ".py",
-    ".jpg", ".jpeg", ".png",
-    "",  # extensionless files are loaded as plain text by load_document()
-}
+ALLOWED_EXTENSIONS = INGEST_FILE_EXTENSIONS
 MAX_FILE_SIZE_MB = MAX_FILE_MB
 MAX_FILE_SIZE_BYTES = int(MAX_FILE_SIZE_MB * 1024 * 1024)
 

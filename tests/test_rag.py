@@ -68,6 +68,46 @@ def test_ingest_and_search_single_file(tmp_path):
     assert "9090" in results[0].page_content
 
 
+def test_ingest_xlsx_sheet_content(tmp_path):
+    import pandas as pd
+
+    excel_file = tmp_path / "report.xlsx"
+    with pd.ExcelWriter(excel_file, engine="openpyxl") as writer:
+        pd.DataFrame([["Project", "Status"], ["Alpha", "Ready"]]).to_excel(
+            writer,
+            sheet_name="Overview",
+            header=False,
+            index=False,
+        )
+
+    chunks = ingest_file(str(excel_file), user_id="account-1")
+
+    assert chunks > 0
+    results = search_documents("What is the status of Project Alpha?", k=1)
+    assert results
+    assert "Ready" in results[0].page_content
+
+
+def test_load_xls_sheet_content(tmp_path, monkeypatch):
+    import pandas as pd
+
+    excel_file = tmp_path / "report.xls"
+    excel_file.write_bytes(b"test")
+    monkeypatch.setattr(
+        pd,
+        "read_excel",
+        lambda *_args, **_kwargs: {
+            "Overview": pd.DataFrame([["Project", "Alpha"]])
+        },
+    )
+
+    documents = ingest_module.load_document(str(excel_file))
+
+    assert len(documents) == 1
+    assert documents[0].metadata["sheet_name"] == "Overview"
+    assert "Alpha" in documents[0].page_content
+
+
 def test_ingest_multiple_files(tmp_path):
     dir_path = tmp_path / "data"
     dir_path.mkdir(parents=True, exist_ok=True)
@@ -216,3 +256,46 @@ def test_index_update_rolls_back_all_files_when_metadata_registration_fails(
     for path, contents in original_contents.items():
         with open(path, "rb") as file:
             assert file.read() == contents
+
+
+def test_corrupt_metadata_registry_fails_explicitly():
+    metadata_path = ingest_module.METADATA_PATH
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    with open(metadata_path, "wb") as file:
+        file.write(b"not a pickle")
+
+    with pytest.raises(RuntimeError, match="Could not read RAG metadata registry"):
+        ingest_module._load_metadata_registry()
+
+
+def test_metadata_registry_rejects_unexpected_structure():
+    import pickle
+
+    metadata_path = ingest_module.METADATA_PATH
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    with open(metadata_path, "wb") as file:
+        pickle.dump({"unexpected": "mapping"}, file)
+
+    with pytest.raises(RuntimeError, match="list of objects"):
+        ingest_module._load_metadata_registry()
+
+
+def test_metadata_registry_save_preserves_previous_file_on_write_failure(
+    monkeypatch,
+):
+    metadata_path = ingest_module.METADATA_PATH
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    original_contents = b"existing metadata"
+    with open(metadata_path, "wb") as file:
+        file.write(original_contents)
+
+    def fail_dump(*_args, **_kwargs):
+        raise OSError("serialization failed")
+
+    monkeypatch.setattr(ingest_module.pickle, "dump", fail_dump)
+
+    with pytest.raises(OSError, match="serialization failed"):
+        ingest_module._save_metadata_registry([])
+
+    with open(metadata_path, "rb") as file:
+        assert file.read() == original_contents

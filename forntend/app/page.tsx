@@ -13,6 +13,7 @@ import { ChatInput } from "@/components/ChatInput";
 import { useChat } from "@/lib/useChat";
 import { useAuth } from "@/lib/useAuth";
 import { setUnauthorizedHandler } from "@/lib/api";
+import { markdownText } from "@/lib/markdown";
 import {
   fetchGeneratedImage,
   generateImage,
@@ -46,15 +47,6 @@ declare global {
       };
     };
   }
-}
-
-function markdownText(node: ReactNode): string {
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(markdownText).join("");
-  if (node && typeof node === "object" && "props" in node) {
-    return markdownText((node.props as { children?: ReactNode }).children);
-  }
-  return "";
 }
 
 function CodeBlock({
@@ -161,10 +153,12 @@ export default function HomePage() {
       .then(({ max_prompt_chars }) => setMaxPromptChars(max_prompt_chars))
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
+          const message =
+            error instanceof Error ? error.message : "";
           setLimitsError(
-            error instanceof Error
-              ? error.message
-              : "Could not load message limits.",
+            message === "Failed to fetch"
+              ? "Could not connect to the backend to load message limits."
+              : message || "Could not load message limits.",
           );
         }
       })
@@ -505,6 +499,8 @@ export default function HomePage() {
           <CodexView
             userKey={(user?.email ?? user?.name ?? "account").toLowerCase()}
             onExit={() => setActiveView("chat")}
+            maxPromptChars={maxPromptChars}
+            limitsError={limitsError}
           />
         ) : activeView === "scheduled" ? (
           <ScheduledView userKey={(user?.email ?? user?.name ?? "account").toLowerCase()} />
@@ -518,32 +514,48 @@ export default function HomePage() {
                   <p className="text-sm text-white/50">Describe what you want Nova GPT to make.</p>
                 </div>
               </div>
-              <label htmlFor="image-prompt" className="mb-2 block text-sm text-white/70">
-                Image description
-              </label>
-              <textarea
-                id="image-prompt"
-                value={imagePrompt}
-                onChange={(event) => setImagePrompt(event.target.value)}
-                maxLength={500}
-                rows={4}
-                disabled={imageGenerating}
-                placeholder="A curious cat exploring a moonlit garden, watercolor style…"
-                className="w-full resize-y rounded-xl border border-surface-border bg-surface-raised px-4 py-3 text-sm text-white outline-none placeholder:text-white/30 focus:border-accent disabled:opacity-60"
-              />
-              <div className="mt-2 flex items-center justify-between text-xs text-white/40">
-                <span>Maximum 500 characters</span>
-                <span>{imagePrompt.length}/500</span>
-              </div>
-              <button
-                type="button"
-                onClick={handleGenerateImage}
-                disabled={imageGenerating || !imagePrompt.trim() || imagePrompt.trim().length > 500}
-                className="mt-4 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleGenerateImage();
+                }}
               >
-                {imageGenerating ? <Loader2 size={16} className="animate-spin" /> : <ImagePlus size={16} />}
-                {imageGenerating ? "Creating image…" : "Generate image"}
-              </button>
+                <label htmlFor="image-prompt" className="mb-2 block text-sm text-white/70">
+                  Image description
+                </label>
+                <textarea
+                  id="image-prompt"
+                  value={imagePrompt}
+                  onChange={(event) => setImagePrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key === "Enter" &&
+                      !event.shiftKey &&
+                      !event.nativeEvent.isComposing
+                    ) {
+                      event.preventDefault();
+                      event.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  maxLength={500}
+                  rows={4}
+                  disabled={imageGenerating}
+                  placeholder="A curious cat exploring a moonlit garden, watercolor style…"
+                  className="w-full resize-y rounded-xl border border-surface-border bg-surface-raised px-4 py-3 text-sm text-white outline-none placeholder:text-white/30 focus:border-accent disabled:opacity-60"
+                />
+                <div className="mt-2 flex items-center justify-between text-xs text-white/40">
+                  <span>Enter to generate · Shift+Enter for a new line</span>
+                  <span>{imagePrompt.length}/500</span>
+                </div>
+                <button
+                  type="submit"
+                  disabled={imageGenerating || !imagePrompt.trim() || imagePrompt.trim().length > 500}
+                  className="mt-4 inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {imageGenerating ? <Loader2 size={16} className="animate-spin" /> : <ImagePlus size={16} />}
+                  {imageGenerating ? "Creating image…" : "Generate image"}
+                </button>
+              </form>
               {imageError && <p role="alert" className="mt-3 text-sm text-red-400">{imageError}</p>}
               {imageGenerating && (
                 <div className="mt-5 flex items-center gap-2 text-sm text-white/55" aria-live="polite">

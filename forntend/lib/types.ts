@@ -34,6 +34,7 @@ export type ChatMessage = {
   id: string;
   role: ChatRole;
   content: string;
+  researchMode?: boolean;
   citations?: Citation[];
   plan?: { steps: string[]; completed?: number };
   streaming?: boolean;
@@ -58,7 +59,7 @@ export type LoginResponseDTO = {
   email?: string;
   name?: string | null;
   has_password?: boolean;
-  detail?: string;
+  detail?: unknown;
 };
 
 export type MeResponseDTO = {
@@ -80,6 +81,8 @@ export type CreateThreadResponseDTO = {
 export type MessageOutDTO = {
   role: string;
   content: string;
+  image_url?: string | null;
+  research_mode?: boolean | null;
 };
 
 export type PinResponseDTO = {

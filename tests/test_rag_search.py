@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
+import pytest
+
 import rag.search as rag_search
+import rag.ingest as rag_ingest
 
 
 def test_search_pdf_expands_candidates_until_user_documents_are_found(
@@ -73,3 +76,31 @@ def test_search_pdf_returns_empty_when_index_has_no_vectors(tmp_path, monkeypatc
     )
 
     assert rag_search.search_pdf("query", user_id="target-user") == []
+
+
+@pytest.mark.parametrize(
+    "metadata_bytes",
+    [b"not a pickle", None],
+)
+def test_preview_and_ingestion_share_metadata_validation(
+    tmp_path, monkeypatch, metadata_bytes
+):
+    import pickle
+
+    metadata_path = tmp_path / "metadata.pkl"
+    with metadata_path.open("wb") as metadata_file:
+        if metadata_bytes is None:
+            pickle.dump({"unexpected": "mapping"}, metadata_file)
+        else:
+            metadata_file.write(metadata_bytes)
+
+    monkeypatch.setattr(rag_search, "METADATA_PATH", str(metadata_path))
+    monkeypatch.setattr(rag_ingest, "METADATA_PATH", str(metadata_path))
+
+    expected_message = (
+        "list of objects" if metadata_bytes is None else "Could not read RAG metadata registry"
+    )
+    with pytest.raises(RuntimeError, match=expected_message):
+        rag_ingest._load_metadata_registry()
+    with pytest.raises(RuntimeError, match=expected_message):
+        rag_search.get_document_preview(["document.txt"])

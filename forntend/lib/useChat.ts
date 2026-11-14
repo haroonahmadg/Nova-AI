@@ -42,6 +42,7 @@ type LastTurnRequest = RetryAttachments & {
   threadId: string;
   userMessageId: string;
   content: string;
+  researchMode: boolean;
 };
 
 function createAttachmentId(kind: "upload" | "image"): string {
@@ -58,6 +59,8 @@ export function useChat() {
   const activeThreadIdRef = useRef<string | null>(null);
   activeThreadIdRef.current = activeThreadId;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [activityLabel, setActivityLabel] = useState<string | null>(null);
@@ -75,6 +78,7 @@ export function useChat() {
   const threadLoadAbortRef = useRef<AbortController | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const audioObjectUrlRef = useRef<string | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioBytesRef = useRef(0);
   const recordingLimitExceededRef = useRef(false);
@@ -84,6 +88,11 @@ export function useChat() {
   const sessionTokenRef = useRef<string | null>(null);
   const generatedObjectUrlsRef = useRef<Set<string>>(new Set());
   const lastTurnRequestRef = useRef<LastTurnRequest | null>(null);
+
+  const clearGeneratedObjectUrls = useCallback(() => {
+    generatedObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    generatedObjectUrlsRef.current.clear();
+  }, []);
 
   // -------------------- Letter-by-letter streaming reveal --------------------
   // Incoming "text" SSE events can arrive in large chunks; revealing a
@@ -132,6 +141,11 @@ export function useChat() {
   const stopSpeaking = useCallback(() => {
     speakAbortRef.current?.abort();
     audioElRef.current?.pause();
+    audioElRef.current = null;
+    if (audioObjectUrlRef.current) {
+      URL.revokeObjectURL(audioObjectUrlRef.current);
+      audioObjectUrlRef.current = null;
+    }
     setVoiceStatus(null);
   }, []);
 
@@ -149,6 +163,7 @@ export function useChat() {
     setThreadsLoading(true);
     setThreadsError(null);
     setActiveThreadId(null);
+    clearGeneratedObjectUrls();
     setMessages([]);
     setMessagesLoading(false);
     setAttachments([]);
@@ -158,9 +173,7 @@ export function useChat() {
     });
     setVoiceError(null);
     setVoiceStatus(null);
-    generatedObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-    generatedObjectUrlsRef.current.clear();
-  }, [stopSpeaking]);
+  }, [clearGeneratedObjectUrls, stopSpeaking]);
 
   const refreshThreads = useCallback(async (signal?: AbortSignal) => {
     setThreadsLoading(true);
@@ -216,12 +229,42 @@ export function useChat() {
 
     setActiveThreadId(threadId);
     setMessagesLoading(true);
+    clearGeneratedObjectUrls();
     setMessages([]);
 
     try {
       const history = await getThreadMessages(threadId, controller.signal);
       if (threadLoadRequestRef.current === requestId) {
-        setMessages(history);
+        const historyWithImages = await Promise.all(
+          history.map(async (message) => {
+            if (!message.imageUrl?.startsWith("/generated-images/")) {
+              return message;
+            }
+            try {
+              const blob = await fetchGeneratedImage(
+                message.imageUrl,
+                controller.signal,
+              );
+              const imageUrl = URL.createObjectURL(blob);
+              if (threadLoadRequestRef.current !== requestId) {
+                URL.revokeObjectURL(imageUrl);
+                return message;
+              }
+              generatedObjectUrlsRef.current.add(imageUrl);
+              return { ...message, imageUrl };
+            } catch (err) {
+              if (controller.signal.aborted) throw err;
+              return {
+                ...message,
+                imageUrl: undefined,
+                content: "[Generated image could not be loaded]",
+              };
+            }
+          }),
+        );
+        if (threadLoadRequestRef.current === requestId) {
+          setMessages(historyWithImages);
+        }
       }
     } catch (err) {
       if (threadLoadRequestRef.current === requestId) {
@@ -236,7 +279,7 @@ export function useChat() {
         setMessagesLoading(false);
       }
     }
-  }, [stopSpeaking]);
+  }, [clearGeneratedObjectUrls, stopSpeaking]);
 
   const startNewChat = useCallback(() => {
     lastTurnRequestRef.current = null;
@@ -253,9 +296,10 @@ export function useChat() {
       prev.forEach((img) => URL.revokeObjectURL(img.previewUrl));
       return [];
     });
+    clearGeneratedObjectUrls();
     setActiveThreadId(null);
     setMessages([]);
-  }, [stopSpeaking]);
+  }, [clearGeneratedObjectUrls, stopSpeaking]);
 
   // -------------------- Document attachments (RAG) --------------------
 
@@ -433,6 +477,7 @@ export function useChat() {
         id: `local-${Date.now()}-user`,
         role: "user",
         content: trimmed + displaySuffix,
+        researchMode,
       };
       const assistantMessage: ChatMessage = {
         id: `local-${Date.now()}-assistant`,
@@ -447,6 +492,7 @@ export function useChat() {
         content: trimmed,
         files: filePayloads,
         images: imagePayloads,
+        researchMode,
       };
 
       setMessages((prev) => [...prev, userMessage, assistantMessage]);
@@ -489,7 +535,13 @@ export function useChat() {
             void fetchGeneratedImage(event.url)
               .then((blob) => {
                 const imageUrl = URL.createObjectURL(blob);
-                if (sessionToken !== getStoredToken()) {
+                if (
+                  !mountedRef.current ||
+                  sessionToken !== getStoredToken() ||
+                  !messagesRef.current.some(
+                    (message) => message.id === assistantMessage.id,
+                  )
+                ) {
                   URL.revokeObjectURL(imageUrl);
                   return;
                 }
@@ -905,15 +957,22 @@ export function useChat() {
         if (controller.signal.aborted) return;
 
         const url = URL.createObjectURL(blob);
+        audioObjectUrlRef.current = url;
         const audio = new Audio(url);
         audioElRef.current = audio;
         setVoiceStatus({ messageId, state: "playing" });
 
         audio.onended = () => {
+          if (audioObjectUrlRef.current !== url) return;
+          audioObjectUrlRef.current = null;
+          audioElRef.current = null;
           setVoiceStatus(null);
           URL.revokeObjectURL(url);
         };
         audio.onerror = () => {
+          if (audioObjectUrlRef.current !== url) return;
+          audioObjectUrlRef.current = null;
+          audioElRef.current = null;
           setVoiceStatus(null);
           URL.revokeObjectURL(url);
           setVoiceError("Couldn't play the generated audio.");
@@ -922,6 +981,11 @@ export function useChat() {
         await audio.play();
       } catch (err) {
         if (controller.signal.aborted) return;
+        if (audioObjectUrlRef.current) {
+          URL.revokeObjectURL(audioObjectUrlRef.current);
+          audioObjectUrlRef.current = null;
+          audioElRef.current = null;
+        }
         setVoiceStatus(null);
         setVoiceError(
           err instanceof ApiError ? err.message : "Couldn't generate audio.",
@@ -1003,7 +1067,9 @@ export function useChat() {
       lastTurnRequestRef.current = null;
       await sendMessage(
         canRestoreAttachments ? previousRequest.content : lastUserMessage.content,
-        false,
+        canRestoreAttachments
+          ? previousRequest.researchMode
+          : lastUserMessage.researchMode ?? false,
         canRestoreAttachments ? previousRequest : undefined,
       );
     } catch (err) {
@@ -1016,12 +1082,19 @@ export function useChat() {
   useEffect(() => {
     mountedRef.current = true;
     const revealTimers = revealTimerRef.current;
+    const generatedObjectUrls = generatedObjectUrlsRef.current;
     return () => {
       mountedRef.current = false;
       threadLoadAbortRef.current?.abort();
       abortRef.current?.abort();
       audioElRef.current?.pause();
+      if (audioObjectUrlRef.current) {
+        URL.revokeObjectURL(audioObjectUrlRef.current);
+        audioObjectUrlRef.current = null;
+      }
       speakAbortRef.current?.abort();
+      generatedObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+      generatedObjectUrls.clear();
       const recorder = mediaRecorderRef.current;
       if (recorder) {
         recorder.stream.getTracks().forEach((track) => track.stop());

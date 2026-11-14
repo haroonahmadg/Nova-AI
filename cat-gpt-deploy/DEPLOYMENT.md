@@ -1,7 +1,7 @@
 # Cat GPT — Free Deployment Guide ($0, no credit card)
 
 **Stack:** GitHub (code) → Render free tier (FastAPI backend) + Vercel Hobby (Next.js frontend)
-**External services:** Groq API (LLM and voice), Gemini API (image generation), Cloudflare Workers AI (image fallback), Hugging Face embeddings (local)
+**External services:** Groq API (LLM and voice), Cloudflare Workers AI (image generation), Hugging Face embeddings (local)
 
 ---
 
@@ -150,8 +150,8 @@ Render free sleeps after 15 min idle (~40 s cold start + model load). To keep Ca
 | **512 MB RAM / 0.1 CPU** | HF embedding model + FAISS live in RAM | Use a small embedding model (e.g. `all-MiniLM-L6-v2`, ~90 MB). If logs show the process killed (OOM), that's the fix or a $7 upgrade. |
 | **Cold start after sleep** | First request slow (~40 s + model load) | Keep-awake ping (§8) avoids it |
 | **Model download** | Embedding model downloads on first run after each deploy | Slow first ingest after a fresh deploy |
-| **Groq free rate limits** | Occasional 429s | Your model-fallback logic already handles this |
-| **Image generation** | Gemini API, with Cloudflare Workers AI fallback | Set `Gemini_API_Key`; fallback requires the `Cloudflare_key` Workers AI token and `CLOUDFLARE_ACCOUNT_ID`. Authentication, quota, network, and server failures from Gemini use the fallback. Cloudflare uses `@cf/black-forest-labs/flux-1-schnell`. |
+| **Groq free rate limits** | Occasional 429s | Text generation moves through `GROQ_MODELS` in order, then retries the last model up to 2 times by default with bounded waits. Vision uses only `GROQ_VISION_MODEL` and retries it; if retries are exhausted, the user receives a rate-limit message. |
+| **Image generation** | Cloudflare Workers AI `@cf/black-forest-labs/flux-1-schnell` | Set `Cloudflare_key` and `CLOUDFLARE_ACCOUNT_ID`. Cloudflare's free plan includes 10,000 Neurons per day; image requests fail after that daily quota is exhausted until it resets. |
 | **Image OCR** | Tesseract system executable | The Render Blueprint uses the Dockerfile, which installs Tesseract through apt. |
 | **Streaming (SSE)** | Works fine on Render | Assistant text streams incrementally; provider/tool-specific activity is shown as a generic status. |
 

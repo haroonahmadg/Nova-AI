@@ -108,6 +108,182 @@ def test_api_startup_initializes_long_term_memory_database(api_client):
     assert dict(get_memories("test-user"))["startup_probe"] == "ready"
 
 
+def test_auth_request_returns_service_unavailable_if_rate_limit_store_fails(
+    api_client, monkeypatch
+):
+    client, api_main = api_client
+
+    class UnavailableLimiter:
+        def reserve(self, _key):
+            from api.rate_limit import RateLimitStoreError
+
+            raise RateLimitStoreError("Redis unavailable")
+
+        def complete(self, *_args, **_kwargs):
+            raise AssertionError("No reservation should have been created.")
+
+    monkeypatch.setattr(api_main, "LOGIN_IP_LIMITER", UnavailableLimiter())
+    response = client.post(
+        "/auth/login",
+        json={"email": "user@example.com", "password": "Password123"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Authentication rate limiting is temporarily unavailable."
+    )
+
+
+def test_auth_request_body_is_limited_before_json_parsing(api_client):
+    client, api_main = api_client
+    response = client.post(
+        "/auth/register",
+        headers={"Content-Type": "application/json"},
+        content=b" " * (api_main.MAX_AUTH_REQUEST_BYTES + 1),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == (
+        "The authentication request exceeds the allowed limit."
+    )
+
+
+def test_chunked_oversized_auth_body_is_rejected_without_content_length(api_client):
+    _, api_main = api_client
+    app_called = False
+    sent = []
+
+    async def downstream(_scope, _receive, _send):
+        nonlocal app_called
+        app_called = True
+
+    chunks = iter([
+        {"type": "http.request", "body": b"1234", "more_body": True},
+        {"type": "http.request", "body": b"5678", "more_body": False},
+    ])
+
+    async def receive():
+        return next(chunks)
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = api_main.AuthRequestBodyLimitMiddleware(
+        downstream,
+        max_bytes=5,
+    )
+    asyncio.run(
+        middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/auth/login",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+    )
+
+    assert not app_called
+    assert sent[0]["status"] == 413
+
+
+def test_rename_returns_server_error_when_metadata_read_fails(
+    api_client, monkeypatch
+):
+    client, api_main = api_client
+    headers = _auth_headers(client)
+    rename_called = False
+
+    def fail_read(_user_id):
+        raise OSError("database unavailable")
+
+    def record_rename(*_args):
+        nonlocal rename_called
+        rename_called = True
+
+    monkeypatch.setattr(api_main, "get_pinned_threads", fail_read)
+    monkeypatch.setattr(api_main, "store_rename_thread", record_rename)
+    response = client.put(
+        "/threads/thread-1/rename",
+        headers=headers,
+        json={"title": "New title"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == (
+        "Could not load conversation metadata right now."
+    )
+    assert not rename_called
+
+
+def test_uploads_share_per_account_storage_quota(api_client, monkeypatch):
+    client, api_main = api_client
+    headers = _auth_headers(client)
+    monkeypatch.setattr(api_main, "MAX_USER_STORAGE_BYTES", 4096)
+    monkeypatch.setattr(api_main, "ingest_file", lambda *_args: 1)
+
+    first = client.post(
+        "/files/upload",
+        headers=headers,
+        data={"thread_id": "thread-1"},
+        files={"files": ("first.txt", b"first", "text/plain")},
+    )
+    second = client.post(
+        "/files/upload",
+        headers=headers,
+        data={"thread_id": "thread-1"},
+        files={"files": ("second.txt", b"second", "text/plain")},
+    )
+
+    assert first.status_code == 200
+    assert first.json()[0]["file_path"]
+    assert second.status_code == 200
+    assert "storage limit" in second.json()[0]["error"]
+
+
+def test_chat_image_attachments_obey_per_account_storage_quota(
+    api_client, monkeypatch
+):
+    client, api_main = api_client
+    headers = _auth_headers(client)
+    user_id = api_main.verify_session_token(
+        headers["Authorization"].removeprefix("Bearer ")
+    )
+    existing_file = (
+        api_main._user_upload_dir(user_id) / "older-thread" / "existing.txt"
+    )
+    existing_file.parent.mkdir(parents=True)
+    existing_file.write_bytes(b"existing")
+    monkeypatch.setattr(api_main, "MAX_USER_STORAGE_BYTES", 4096)
+    monkeypatch.setattr(
+        api_main,
+        "stream_agent",
+        lambda **_kwargs: pytest.fail("The over-quota image must not start a chat."),
+    )
+
+    response = client.post(
+        "/threads/thread-1/messages/stream",
+        headers=headers,
+        json={
+            "content": "What is in this image?",
+            "images": [
+                {
+                    "image_bytes": "eA==",
+                    "image_type": "image/png",
+                    "filename": "image.png",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 413
+    assert "storage limit" in response.json()["detail"].lower()
+    image_dir = api_main._user_upload_dir(user_id) / "thread-1"
+    assert not image_dir.exists()
+
+
 def test_deleted_thread_history_is_not_returned_when_cleanup_fails(
     api_client, monkeypatch
 ):
@@ -256,6 +432,24 @@ def test_chat_stream_preserves_validation_errors(api_client, monkeypatch):
     )
 
     assert response.status_code == 422
+
+
+def test_chat_stream_rejects_too_many_file_references(api_client, monkeypatch):
+    client, api_main = api_client
+    monkeypatch.setattr(api_main, "verify_session_token", lambda _token: "test-user")
+    files = [
+        {"filename": f"file-{index}.txt", "file_path": "unused"}
+        for index in range(api_main.MAX_UPLOAD_FILES + 1)
+    ]
+
+    response = client.post(
+        "/threads/thread-1/messages/stream",
+        headers={"Authorization": "Bearer test-token"},
+        json={"content": "Summarize these.", "files": files},
+    )
+
+    assert response.status_code == 422
+    assert "at most" in response.json()["detail"][0]["msg"]
 
 
 def test_oversized_audio_is_read_only_to_limit_plus_one(api_client, monkeypatch):

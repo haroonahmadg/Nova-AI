@@ -24,12 +24,17 @@ import base64
 import binascii
 import logging
 import re
+import sqlite3
 import uuid
 from datetime import date
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from utils.numeric_runtime import configure_numeric_thread_limits
+
+configure_numeric_thread_limits()
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -61,6 +66,7 @@ from rag.ingest import ingest_file, progress_context
 from api.config import (
     ALLOWED_FILE_EXTENSIONS,
     ALLOWED_IMAGE_EXTENSIONS,
+    DATA_DIR,
     EMAIL_MAX_LENGTH,
     FRONTEND_ORIGINS,
     MAX_FILE_MB,
@@ -68,6 +74,7 @@ from api.config import (
     MAX_IMAGES_PER_REQUEST,
     MAX_PROMPT_CHARS,
     MAX_UPLOAD_FILES,
+    MAX_USER_STORAGE_MB,
     UPLOAD_DIR,
 )
 from api.schemas import (
@@ -108,7 +115,8 @@ from api.rate_limit import (
     LOGIN_EMAIL_LIMITER,
     LOGIN_IP_LIMITER,
     REGISTER_IP_LIMITER,
-    AttemptLimiter,
+    RateLimiter,
+    RateLimitStoreError,
 )
 from api.store import (
     AccountExistsError,
@@ -131,6 +139,12 @@ from api.streaming import (
     extract_updates_text,
     format_sse,
 )
+from utils.storage import (
+    UserStorageLimitExceeded,
+    reserve_user_storage,
+    safe_storage_component,
+    user_upload_dir,
+)
 
 logger = logging.getLogger(__name__)
 MAX_UPLOAD_REQUEST_BYTES = int(
@@ -138,6 +152,85 @@ MAX_UPLOAD_REQUEST_BYTES = int(
 )
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
 MAX_AUDIO_REQUEST_BYTES = MAX_AUDIO_BYTES + 64 * 1024
+MAX_AUTH_REQUEST_BYTES = 64 * 1024
+MAX_USER_STORAGE_BYTES = MAX_USER_STORAGE_MB * 1024 * 1024
+
+
+class AuthRequestBodyLimitMiddleware:
+    """Bound auth JSON bodies before FastAPI parses untrusted credentials."""
+
+    _AUTH_PATHS = {
+        "/auth/google",
+        "/auth/register",
+        "/auth/login",
+        "/auth/set-password",
+    }
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") not in self._AUTH_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        content_length = dict(scope.get("headers", [])).get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                await AudioRequestBodyLimitMiddleware._reject(
+                    send, 400, "The authentication request has an invalid content length."
+                )
+                return
+            if declared_size < 0:
+                await AudioRequestBodyLimitMiddleware._reject(
+                    send, 400, "The authentication request has an invalid content length."
+                )
+                return
+            if declared_size > self.max_bytes:
+                await AudioRequestBodyLimitMiddleware._reject(
+                    send, 413, "The authentication request exceeds the allowed limit."
+                )
+                return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            if message["type"] != "http.request":
+                continue
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > self.max_bytes:
+                await AudioRequestBodyLimitMiddleware._reject(
+                    send, 413, "The authentication request exceeds the allowed limit."
+                )
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        body_bytes = bytes(body)
+        replayed = False
+
+        async def receive_with_body():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {
+                    "type": "http.request",
+                    "body": body_bytes,
+                    "more_body": False,
+                }
+            return await receive()
+
+        await self.app(scope, receive_with_body, send)
 
 
 class AudioRequestBodyLimitMiddleware:
@@ -475,6 +568,11 @@ app.add_middleware(
     max_bytes=MAX_AUDIO_REQUEST_BYTES,
 )
 
+app.add_middleware(
+    AuthRequestBodyLimitMiddleware,
+    max_bytes=MAX_AUTH_REQUEST_BYTES,
+)
+
 app.add_middleware(AuthMiddleware)
 
 app.add_middleware(
@@ -498,13 +596,11 @@ app.add_middleware(
 def _safe_path_part(value: str) -> str:
     """Make a user-supplied id safe to use as ONE folder name."""
 
-    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", value or "").strip("_")[:100]
-
-    return cleaned or "unknown"
+    return safe_storage_component(value)
 
 
 def _user_upload_dir(user_id: str) -> Path:
-    return UPLOAD_DIR / _safe_path_part(user_id)
+    return user_upload_dir(UPLOAD_DIR, user_id)
 
 
 def _is_user_upload_path(path_text: str, user_id: str) -> bool:
@@ -529,25 +625,79 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _raise_if_limited(*checks: tuple[AttemptLimiter, str]) -> None:
-    """Raise HTTP 429 when any (limiter, key) pair is over its limit."""
+def _finish_auth_attempts(
+    reservations: list[tuple[RateLimiter, str, str]],
+    *,
+    retain: bool,
+    reset_prior_for: tuple[RateLimiter, str] | None = None,
+) -> None:
+    errors = []
+    for limiter, key, reservation in reservations:
+        try:
+            limiter.complete(
+                key,
+                reservation,
+                retain=retain,
+                reset_prior=(
+                    reset_prior_for is not None
+                    and limiter is reset_prior_for[0]
+                    and key == reset_prior_for[1]
+                ),
+            )
+        except RateLimitStoreError as exc:
+            errors.append(exc)
 
-    retry_after = max(
-        (limiter.retry_after(key) for limiter, key in checks),
-        default=0,
-    )
-
-    if retry_after > 0:
-        minutes = max(1, math.ceil(retry_after / 60))
-
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                "Too many attempts. Please try again in about "
-                f"{minutes} minute{'s' if minutes != 1 else ''}."
-            ),
-            headers={"Retry-After": str(retry_after)},
+    if errors:
+        logger.error(
+            "Could not complete %d authentication rate-limit reservation(s) (%s).",
+            len(errors),
+            type(errors[0]).__name__,
         )
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication rate limiting is temporarily unavailable.",
+        ) from errors[0]
+
+
+def _reserve_auth_attempts(
+    *checks: tuple[RateLimiter, str],
+) -> list[tuple[RateLimiter, str, str]]:
+    """Reserve each key atomically before running credential checks."""
+
+    reservations: list[tuple[RateLimiter, str, str]] = []
+    try:
+        for limiter, key in checks:
+            reservation, retry_after = limiter.reserve(key)
+            if retry_after:
+                _finish_auth_attempts(reservations, retain=False)
+                minutes = max(1, math.ceil(retry_after / 60))
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Too many attempts. Please try again in about "
+                        f"{minutes} minute{'s' if minutes != 1 else ''}."
+                    ),
+                    headers={"Retry-After": str(retry_after)},
+                )
+            if not reservation:
+                raise RateLimitStoreError(
+                    "The shared rate-limit store returned no reservation."
+                )
+            reservations.append((limiter, key, reservation))
+    except RateLimitStoreError as exc:
+        try:
+            _finish_auth_attempts(reservations, retain=False)
+        except HTTPException:
+            logger.exception(
+                "Could not release partial authentication rate-limit reservations."
+            )
+        logger.exception("Shared authentication rate-limit store is unavailable.")
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication rate limiting is temporarily unavailable.",
+        ) from exc
+
+    return reservations
 
 
 # ============================================================
@@ -574,17 +724,22 @@ def google_login(
 ) -> LoginResponse:
 
     ip_key = _client_ip(request)
-    _raise_if_limited((LOGIN_IP_LIMITER, ip_key))
+    reservations = _reserve_auth_attempts((LOGIN_IP_LIMITER, ip_key))
 
     try:
         user = verify_google_credential(request_body.credential)
     except ValueError as exc:
-        LOGIN_IP_LIMITER.record(ip_key)
+        _finish_auth_attempts(reservations, retain=True)
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except RuntimeError as exc:
+        _finish_auth_attempts(reservations, retain=False)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    LOGIN_IP_LIMITER.reset(ip_key)
+    _finish_auth_attempts(
+        reservations,
+        retain=False,
+        reset_prior_for=(LOGIN_IP_LIMITER, ip_key),
+    )
 
     token = create_session_token(user["user_id"])
 
@@ -604,8 +759,7 @@ def password_register(
     """Create an email + password account and sign it in."""
 
     ip_key = _client_ip(request)
-
-    _raise_if_limited((REGISTER_IP_LIMITER, ip_key))
+    reservations = _reserve_auth_attempts((REGISTER_IP_LIMITER, ip_key))
 
     try:
         user = register_with_password(
@@ -616,14 +770,16 @@ def password_register(
     except AccountExistsError as exc:
         # Counts toward the limit so this cannot be used to probe
         # which emails are registered.
-        REGISTER_IP_LIMITER.record(ip_key)
+        _finish_auth_attempts(reservations, retain=True)
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
+        _finish_auth_attempts(reservations, retain=False)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
+        _finish_auth_attempts(reservations, retain=False)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    REGISTER_IP_LIMITER.record(ip_key)
+    _finish_auth_attempts(reservations, retain=True)
 
     token = create_session_token(user["user_id"])
 
@@ -645,7 +801,7 @@ def password_login(
     ip_key = _client_ip(request)
     email_key = f"email:{(request_body.email or '').strip().lower()[:EMAIL_MAX_LENGTH]}"
 
-    _raise_if_limited(
+    reservations = _reserve_auth_attempts(
         (LOGIN_EMAIL_LIMITER, email_key),
         (LOGIN_IP_LIMITER, ip_key),
     )
@@ -653,13 +809,17 @@ def password_login(
     try:
         user = login_with_password(request_body.email, request_body.password)
     except InvalidCredentialsError as exc:
-        LOGIN_EMAIL_LIMITER.record(email_key)
-        LOGIN_IP_LIMITER.record(ip_key)
+        _finish_auth_attempts(reservations, retain=True)
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except RuntimeError as exc:
+        _finish_auth_attempts(reservations, retain=False)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    LOGIN_EMAIL_LIMITER.reset(email_key)
+    _finish_auth_attempts(
+        reservations,
+        retain=False,
+        reset_prior_for=(LOGIN_EMAIL_LIMITER, email_key),
+    )
 
     token = create_session_token(user["user_id"])
 
@@ -685,7 +845,7 @@ def set_password(
     user_id = request.state.user_id
     limit_key = f"user:{user_id}"
 
-    _raise_if_limited((LOGIN_EMAIL_LIMITER, limit_key))
+    reservations = _reserve_auth_attempts((LOGIN_EMAIL_LIMITER, limit_key))
 
     try:
         set_user_password(
@@ -694,18 +854,25 @@ def set_password(
             request_body.current_password,
         )
     except UserNotFoundError as exc:
+        _finish_auth_attempts(reservations, retain=False)
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except InvalidCredentialsError as exc:
         # 403, not 401: the session is fine, only the current password
         # is wrong, so the frontend must not log the person out.
-        LOGIN_EMAIL_LIMITER.record(limit_key)
+        _finish_auth_attempts(reservations, retain=True)
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
+        _finish_auth_attempts(reservations, retain=False)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
+        _finish_auth_attempts(reservations, retain=False)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    LOGIN_EMAIL_LIMITER.reset(limit_key)
+    _finish_auth_attempts(
+        reservations,
+        retain=False,
+        reset_prior_for=(LOGIN_EMAIL_LIMITER, limit_key),
+    )
 
     return SetPasswordResponse(password_set=True)
 
@@ -1046,19 +1213,25 @@ def rename_thread_endpoint(
         raise HTTPException(status_code=400, detail="A valid thread_id is required.")
 
     try:
+        pinned = get_pinned_threads(user_id)
+        archived = get_archived_threads(user_id)
+    except (OSError, sqlite3.Error) as exc:
+        logger.exception("Could not read conversation metadata before rename.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not load conversation metadata right now.",
+        ) from exc
+
+    try:
         store_rename_thread(thread_id, user_id, request_body.title)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        pinned = get_pinned_threads(user_id)
-    except Exception:
-        pinned = set()
-
-    try:
-        archived = get_archived_threads(user_id)
-    except Exception:
-        archived = set()
+    except (OSError, sqlite3.Error) as exc:
+        logger.exception("Could not save renamed conversation title.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not update the conversation title right now.",
+        ) from exc
 
     return ThreadSummary(
         thread_id=thread_id,
@@ -1274,9 +1447,8 @@ async def send_message_stream(
     }
 
     if request_body.images:
-        image_upload_dir = _user_upload_dir(user_id) / _safe_path_part(thread_id)
+        validated_images: list[tuple[str, bytes]] = []
         try:
-            image_upload_dir.mkdir(parents=True, exist_ok=True)
             for image in request_body.images:
                 max_encoded_length = 4 * math.ceil(
                     MAX_IMAGE_MB * 1024 * 1024 / 3
@@ -1311,9 +1483,24 @@ async def send_message_stream(
                         "image/webp": ".webp",
                         "image/gif": ".gif",
                     }.get(image.image_type.lower(), ".png")
-                (image_upload_dir / f"{uuid.uuid4().hex[:16]}{suffix}").write_bytes(raw_image)
+                validated_images.append((suffix, raw_image))
         except HTTPException:
             raise
+
+        try:
+            await run_in_threadpool(
+                _save_message_images,
+                user_id,
+                thread_id,
+                validated_images,
+            )
+        except UserStorageLimitExceeded as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        except FileLockTimeout as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Account storage is busy. Please try again in a moment.",
+            ) from exc
         except OSError as exc:
             raise HTTPException(
                 status_code=500, detail=f"Could not save uploaded images: {exc}"
@@ -1539,9 +1726,50 @@ def _save_upload(
     safe_name = Path(filename).name or "uploaded-file"
     saved_path = thread_dir / f"{uuid.uuid4().hex[:12]}_{safe_name}"
 
-    saved_path.write_bytes(file_bytes)
+    with reserve_user_storage(
+        user_id,
+        upload_dir=UPLOAD_DIR,
+        generated_image_dir=get_generated_image_dir(user_id).parent,
+        lock_dir=DATA_DIR / ".storage-locks",
+        max_bytes=MAX_USER_STORAGE_BYTES,
+        requested_bytes=len(file_bytes),
+    ):
+        saved_path.write_bytes(file_bytes)
 
     return saved_path
+
+
+def _save_message_images(
+    user_id: str,
+    thread_id: str,
+    images: list[tuple[str, bytes]],
+) -> None:
+    """Persist chat images under the same account quota as uploads."""
+
+    image_upload_dir = _user_upload_dir(user_id) / _safe_path_part(thread_id)
+    saved_paths: list[Path] = []
+
+    with reserve_user_storage(
+        user_id,
+        upload_dir=UPLOAD_DIR,
+        generated_image_dir=get_generated_image_dir(user_id).parent,
+        lock_dir=DATA_DIR / ".storage-locks",
+        max_bytes=MAX_USER_STORAGE_BYTES,
+        requested_bytes=sum(len(image_bytes) for _, image_bytes in images),
+    ):
+        image_upload_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            for suffix, image_bytes in images:
+                saved_path = image_upload_dir / f"{uuid.uuid4().hex[:16]}{suffix}"
+                saved_path.write_bytes(image_bytes)
+                saved_paths.append(saved_path)
+        except OSError:
+            for saved_path in saved_paths:
+                try:
+                    saved_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.exception("Could not remove a partially saved chat image.")
+            raise
 
 
 @app.post("/files/upload", response_model=list[UploadedFileResult])
@@ -1619,7 +1847,24 @@ async def upload_files(
             continue
 
         try:
-            saved_path = _save_upload(filename, file_bytes, thread_id, user_id)
+            saved_path = await run_in_threadpool(
+                _save_upload,
+                filename,
+                file_bytes,
+                thread_id,
+                user_id,
+            )
+        except UserStorageLimitExceeded as exc:
+            results.append(UploadedFileResult(filename=filename, error=str(exc)))
+            continue
+        except FileLockTimeout:
+            results.append(
+                UploadedFileResult(
+                    filename=filename,
+                    error="Account storage is busy. Please try again in a moment.",
+                )
+            )
+            continue
         except OSError as exc:
             results.append(
                 UploadedFileResult(
