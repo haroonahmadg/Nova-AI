@@ -243,10 +243,14 @@ def test_system_prompt_requests_examples_balanced_analysis_and_real_sources():
 
     prompt = " ".join(build_system_prompt().lower().split())
 
+    assert "you are nova ai" in prompt
     assert "concrete, real-world examples" in prompt
     assert "societal trade-offs" in prompt
     assert "never invent a publication" in prompt
     assert "single uncorroborated result" in prompt
+    assert "call `send_email`" in prompt
+    assert "verified google account address" in prompt
+    assert "confirm delivery only when the tool reports success" in prompt
 
 
 def test_research_synthesis_prompt_requires_grounded_sources(monkeypatch):

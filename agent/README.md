@@ -27,3 +27,10 @@ the request does not enable it. The Next.js chat input's Think toggle enables
 the research plan and synthesis flow.
 
 See the [project guide](../README.md) for setup and tests.
+
+The email tool uses Resend. Configure `RESEND_API_KEY` and
+`RESEND_FROM_EMAIL` on the backend; the sender address must use a domain
+verified in the same Resend account. The tool sends only to the authenticated
+user's verified Google address. For restricted testing, set
+`RESEND_TEST_MODE=true` to use `onboarding@resend.dev`; Resend only allows
+that sender to deliver to the email address that owns the Resend account.

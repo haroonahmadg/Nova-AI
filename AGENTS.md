@@ -5,7 +5,7 @@
 
 ## Project purpose
 
-Cat GPT is a portfolio chat assistant built on FastAPI, LangGraph, FAISS-backed RAG, and a Next.js frontend. The assistant's system prompt identifies it as "Nova GPT". The app uses per-user isolation for threads, uploads, RAG indexes, and memory.
+Cat GPT is a portfolio chat assistant built on FastAPI, LangGraph, FAISS-backed RAG, and a Next.js frontend. The assistant's system prompt identifies it as "Nova AI". The app uses per-user isolation for threads, uploads, RAG indexes, and memory.
 
 ## Current architecture
 

@@ -2420,6 +2420,31 @@ def send_email(subject: str, body: str) -> str:
     api_key = _tool_env("RESEND_API_KEY")
     if not api_key:
         return "Email sending is not configured on this server."
+    raw_test_mode = _tool_env("RESEND_TEST_MODE", "false") or "false"
+    normalized_test_mode = raw_test_mode.casefold()
+    if normalized_test_mode not in {
+        "true",
+        "false",
+        "1",
+        "0",
+        "yes",
+        "no",
+        "on",
+        "off",
+    }:
+        return "Email sending is not configured: RESEND_TEST_MODE must be true or false."
+    test_mode = normalized_test_mode in {"true", "1", "yes", "on"}
+    sender = (
+        "onboarding@resend.dev"
+        if test_mode
+        else _tool_env("RESEND_FROM_EMAIL")
+    )
+    if not sender:
+        return (
+            "Email sending is not configured: set RESEND_FROM_EMAIL to an "
+            "address on a domain verified in Resend, or enable "
+            "RESEND_TEST_MODE for Resend's restricted test sender."
+        )
 
     user_id = active_user_id.get()
     if not user_id:
@@ -2461,7 +2486,7 @@ def send_email(subject: str, body: str) -> str:
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "from": "Cat GPT <onboarding@resend.dev>",
+                "from": sender,
                 "to": [recipient],
                 "subject": clean_subject,
                 "text": clean_body,
@@ -2476,10 +2501,20 @@ def send_email(subject: str, body: str) -> str:
         return f"Email request failed ({type(exc).__name__}); please try again."
     if response.status_code == 429:
         _release_email_reservation(reservation_id)
-        return "The email provider rate limit was reached; please try again later."
+        detail = _resend_error_detail(response)
+        suffix = f" Provider response: {detail}" if detail else ""
+        return (
+            "The email provider rate limit was reached; please try again later."
+            f"{suffix}"
+        )
     if not 200 <= response.status_code < 300:
         _release_email_reservation(reservation_id)
-        return f"Email provider rejected the request with HTTP {response.status_code}."
+        detail = _resend_error_detail(response)
+        suffix = f" Provider response: {detail}" if detail else ""
+        return (
+            "Email provider rejected the request with "
+            f"HTTP {response.status_code}.{suffix}"
+        )
     try:
         result = response.json()
     except (ValueError, TypeError):
@@ -2488,3 +2523,24 @@ def send_email(subject: str, body: str) -> str:
         return "Email provider accepted the request but omitted its message ID."
     emit_tool_event("Email sent", event="tool_completed", tool="send_email")
     return f"Email sent to your verified address (message {result['id'][:80]})."
+
+
+def _resend_error_detail(response: httpx.Response) -> str | None:
+    """Extract a bounded, single-line provider error without exposing headers."""
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    message = payload.get("message")
+    error_name = payload.get("name")
+    if not isinstance(message, str) or not message.strip():
+        return None
+
+    detail = " ".join(message.split())
+    if isinstance(error_name, str) and error_name.strip():
+        detail = f"{error_name.strip()}: {detail}"
+    return detail[:400]

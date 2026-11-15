@@ -384,6 +384,11 @@ def test_send_email_uses_verified_user_and_ignores_recipient_override(
     monkeypatch, email_database
 ):
     monkeypatch.setenv("RESEND_API_KEY", "test-resend-key")
+    monkeypatch.setenv("RESEND_TEST_MODE", "false")
+    monkeypatch.setenv(
+        "RESEND_FROM_EMAIL",
+        "Cat GPT <noreply@example.com>",
+    )
     sent = {}
 
     def post(url, **kwargs):
@@ -399,6 +404,7 @@ def test_send_email_uses_verified_user_and_ignores_recipient_override(
         "to": "attacker@example.com",
     })
     assert "Email sent" in result
+    assert sent["json"]["from"] == "Cat GPT <noreply@example.com>"
     assert sent["json"]["to"] == ["verified@example.com"]
     assert len(sent["json"]["text"]) == 2000
     assert sent["timeout"] == 10
@@ -409,6 +415,8 @@ def test_send_email_daily_cap_and_unconfigured_key(monkeypatch, email_database):
         {"subject": "Subject", "body": "Body"}
     )
     monkeypatch.setenv("RESEND_API_KEY", "test-resend-key")
+    monkeypatch.setenv("RESEND_TEST_MODE", "false")
+    monkeypatch.setenv("RESEND_FROM_EMAIL", "noreply@example.com")
     monkeypatch.setenv("EMAIL_DAILY_LIMIT", "1")
     monkeypatch.setattr(
         agent_tools.httpx,
@@ -424,6 +432,81 @@ def test_send_email_daily_cap_and_unconfigured_key(monkeypatch, email_database):
     assert "subject cannot be empty" in agent_tools.send_email.invoke(
         {"subject": " ", "body": "Body"}
     )
+
+
+def test_send_email_requires_configured_sender(monkeypatch, email_database):
+    monkeypatch.setenv("RESEND_API_KEY", "test-resend-key")
+    monkeypatch.setenv("RESEND_TEST_MODE", "false")
+    monkeypatch.delenv("RESEND_FROM_EMAIL", raising=False)
+    result = agent_tools.send_email.invoke({
+        "subject": "Subject",
+        "body": "Body",
+    })
+    assert "RESEND_FROM_EMAIL" in result
+    assert "verified in Resend" in result
+
+
+def test_send_email_test_mode_uses_resend_test_sender(
+    monkeypatch, email_database
+):
+    monkeypatch.setenv("RESEND_API_KEY", "test-resend-key")
+    monkeypatch.setenv("RESEND_TEST_MODE", "true")
+    monkeypatch.setenv("RESEND_FROM_EMAIL", "noreply@unverified-domain.example")
+    sent = {}
+    monkeypatch.setattr(
+        agent_tools.httpx,
+        "post",
+        lambda _url, **kwargs: sent.update(kwargs) or FakeResponse(
+            {"id": "test-mode-email"}
+        ),
+    )
+
+    result = agent_tools.send_email.invoke({
+        "subject": "Test Email from Nova AI",
+        "body": "This confirms the email tool is working.",
+    })
+
+    assert "Email sent" in result
+    assert sent["json"]["from"] == "onboarding@resend.dev"
+    assert sent["json"]["to"] == ["verified@example.com"]
+
+
+def test_send_email_rejects_invalid_test_mode(monkeypatch, email_database):
+    monkeypatch.setenv("RESEND_API_KEY", "test-resend-key")
+    monkeypatch.setenv("RESEND_TEST_MODE", "sometimes")
+
+    result = agent_tools.send_email.invoke({
+        "subject": "Subject",
+        "body": "Body",
+    })
+
+    assert "RESEND_TEST_MODE must be true or false" in result
+
+
+def test_send_email_reports_resend_domain_verification_error(
+    monkeypatch, email_database
+):
+    monkeypatch.setenv("RESEND_API_KEY", "test-resend-key")
+    monkeypatch.setenv("RESEND_FROM_EMAIL", "Cat GPT <noreply@example.com>")
+    monkeypatch.setattr(
+        agent_tools.httpx,
+        "post",
+        lambda *args, **kwargs: FakeResponse(
+            {
+                "name": "validation_error",
+                "message": "The example.com domain is not verified. Please, add and verify your domain.",
+            },
+            status_code=403,
+        ),
+    )
+
+    result = agent_tools.send_email.invoke({
+        "subject": "Subject",
+        "body": "Body",
+    })
+    assert "HTTP 403" in result
+    assert "domain is not verified" in result
+    assert "not configured" not in result
 
 
 def test_all_extra_tools_are_registered():
